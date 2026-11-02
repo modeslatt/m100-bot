@@ -1,0 +1,354 @@
+# Эталонный набор разговорных фраз мастера → ожидаемые позиции сметы.
+#
+# row — номер строки на листе (см. tests/fixtures/sample.xlsx), qty — объём.
+# Статусы:
+#   ok         (по умолчанию) — однозначно эта строка и этот объём
+#   ambiguous  — бот обязан спросить; candidates — все допустимые варианты
+#   not_found  — такой позиции в смете нет, бот не должен ничего подставлять
+#   clarify    — позиция понятна, но единицы не совпадают со сметой или объём не назван
+#
+# Правила (согласовано 2026-11-02):
+#   - объём не назван: единственное число + позиция в «шт» → qty 1; иначе (м, кг, …) → clarify;
+#   - любая названная работа вне сметы → not_found (пустой список — только если работ нет вовсе);
+#   - пишем только в ту строку, которая названа: материал («кабель 3х2,5») — в строку материала,
+#     работа («кабель на скобах») — в строку работы; парные строки работ (68–71) не дописываем;
+#   - без явного материала («шестёрка», «девятка») — ambiguous по всем позициям с этим размером.
+#
+# Порядок упоминаний в expected не важен.
+# ВАЖНО: не менять expected ради прохождения теста. Спорный эталон — обсудить и поправить осознанно.
+
+# ───────────── Фреонопровод (медь) — строки 17/18/19: Д6,35 / Д9,52 / Д12,7 ─────────────
+- id: cu-01
+  tags: [copper]
+  text: "медь 6-ка 15 м"
+  expected: [{row: 17, qty: 15}]
+
+- id: cu-02
+  tags: [copper, ambiguous]
+  text: "проложили шестёрку 20 метров"
+  expected: [{status: ambiguous, candidates: [17, 20]}]   # «медь» не названа: медь или изоляция Д6,35
+
+- id: cu-03
+  tags: [copper, ambiguous]
+  text: "девятку протянули 12м"
+  expected: [{status: ambiguous, candidates: [18, 21, 33]}]   # медь Д9,52 / изоляция Д9,52 / капиллярка Ф9
+
+- id: cu-04
+  tags: [copper]
+  text: "медная труба 9,52 — 8 метров"
+  expected: [{row: 18, qty: 8}]
+
+- id: cu-05
+  tags: [copper]
+  text: "фреонку 12.7 положили 30"
+  expected: [{row: 19, qty: 30}]
+
+- id: cu-06
+  tags: [copper]
+  text: "медь на 1/2 дюйма 10 м"
+  expected: [{row: 19, qty: 10}]   # 1/2" = 12,7 мм
+
+- id: cu-07
+  tags: [copper]
+  text: "трасса 1/4 и 3/8 по 14 метров"
+  expected: [{row: 17, qty: 14}, {row: 18, qty: 14}]   # 1/4" = 6,35; 3/8" = 9,52
+
+- id: cu-08
+  tags: [copper, ambiguous]
+  text: "медь проложили 25 метров"
+  expected: [{status: ambiguous, candidates: [17, 18, 19]}]   # диаметр не назван
+
+# ───────────── Изоляция — строки 20/21/22 ─────────────
+- id: iso-01
+  tags: [insulation]
+  text: "изоляцию на шестёрку 15 м"
+  expected: [{row: 20, qty: 15}]
+
+- id: iso-02
+  tags: [insulation, ambiguous]
+  text: "кифлекс 9 мм 10 метров"
+  expected: [{status: ambiguous, candidates: [20, 21, 22]}]   # «9 мм» = толщина стенки б=9мм у всех трёх
+
+- id: iso-03
+  tags: [insulation, ambiguous]
+  text: "изоляцию надели 40 м"
+  expected: [{status: ambiguous, candidates: [20, 21, 22]}]
+
+# ───────────── Кабели — строки 55–60 ─────────────
+- id: cab-01
+  tags: [cable]
+  text: "кабель 3 на 2,5 — 56 м"
+  expected: [{row: 55, qty: 56}]
+
+- id: cab-02
+  tags: [cable]
+  text: "тройку на полтора протянули 16 метров"
+  expected: [{row: 56, qty: 16}]   # 3х1,5
+
+- id: cab-03
+  tags: [cable]
+  text: "4х1.5 24м"
+  expected: [{row: 57, qty: 24}]
+
+- id: cab-04
+  tags: [cable]
+  text: "кабель три на четыре 20 метров"
+  expected: [{row: 58, qty: 20}]
+
+- id: cab-05
+  tags: [cable]
+  text: "огнестойкий 5 на 6 — 4 метра"
+  expected: [{row: 59, qty: 4}]
+
+- id: cab-06
+  tags: [cable]
+  text: "двушку полтора 10 м"
+  expected: [{row: 60, qty: 10}]   # 2х1,5
+
+- id: cab-07
+  tags: [cable, ambiguous]
+  text: "кабеля положили 50 метров"
+  expected: [{status: ambiguous, candidates: [55, 56, 57, 58, 59, 60]}]
+
+- id: cab-08
+  tags: [cable, ambiguous]
+  text: "кабель полторашку 30 м"
+  expected: [{status: ambiguous, candidates: [56, 57, 60]}]   # 3х1,5 / 4х1,5 / 2х1,5
+
+- id: cab-09
+  tags: [cable, not_found]
+  text: "кабель 3х6 15 метров"
+  expected: [{status: not_found}]   # такого сечения в смете нет
+
+# ───────────── Автоматы — строки 61/62/63 ─────────────
+- id: av-01
+  tags: [breaker]
+  text: "поставили автомат на 16"
+  expected: [{row: 61, qty: 1}]
+
+- id: av-02
+  tags: [breaker]
+  text: "автоматы 20А и 32А по одному"
+  expected: [{row: 62, qty: 1}, {row: 63, qty: 1}]
+
+- id: av-03
+  tags: [breaker, ambiguous]
+  text: "смонтировал автомат"
+  expected: [{status: ambiguous, candidates: [61, 62, 63]}]   # строку 68 «Установка АВ» не трогаем (решено)
+
+- id: av-04
+  tags: [breaker, not_found]
+  text: "автомат на 25 ампер 1 шт"
+  expected: [{status: not_found}]
+
+# ───────────── Крепёж и дренаж ─────────────
+- id: fx-01
+  tags: [fastener]
+  text: "10 хомутов под фреон"
+  expected: [{row: 44, qty: 10}]
+
+- id: fx-02
+  tags: [fastener]
+  text: "хомуты на дренаж 25 штук"
+  expected: [{row: 43, qty: 25}]
+
+- id: fx-03
+  tags: [fastener, ambiguous]
+  text: "поставили 12 хомутов"
+  expected: [{status: ambiguous, candidates: [43, 44]}]
+
+- id: fx-04
+  tags: [fastener]
+  text: "шпилек восьмёрок 7 штук"
+  expected: [{row: 45, qty: 7}]
+
+- id: dr-01
+  tags: [drain]
+  text: "дренаж пп 12 метров"
+  expected: [{row: 34, qty: 12}]
+
+- id: dr-02
+  tags: [drain]
+  text: "капилярку 7 м"
+  expected: [{row: 33, qty: 7}]
+
+- id: dr-03
+  tags: [drain]
+  text: "отводов 90 на 25-й 4 шт"
+  expected: [{row: 35, qty: 4}]
+
+- id: dr-04
+  tags: [drain, ambiguous]
+  text: "тройник 25 — 3 шт"
+  expected: [{status: ambiguous, candidates: [36, 37]}]   # Д25 / Д25х20х25
+
+- id: dr-05
+  tags: [drain]
+  text: "переходной тройник 25-20-25 две штуки"
+  expected: [{row: 37, qty: 2}]
+
+- id: dr-06
+  tags: [drain]
+  text: "сифоны с сухим затвором 2 шт"
+  expected: [{row: 39, qty: 2}]
+
+- id: dr-07
+  tags: [drain]
+  text: "поставили дренажный насос 1"
+  expected: [{row: 23, qty: 1}]   # буквально «Дренажный насос» (Aspen); помпа Sauermann — строка 25
+
+- id: dr-08
+  tags: [drain]
+  text: "помпу зауэрман 1 шт"
+  expected: [{row: 25, qty: 1}]
+
+# ───────────── Гильзы и сверление ─────────────
+- id: sl-01
+  tags: [sleeve]
+  text: "гильзы под фреон 76-е 4 шт"
+  expected: [{row: 46, qty: 4}]
+
+- id: sl-02
+  tags: [sleeve]
+  text: "гильза 40 под дренаж 2 шт"
+  expected: [{row: 47, qty: 2}]
+
+- id: sl-03
+  tags: [drilling, ambiguous]
+  text: "насверлили отверстий 80-х 4 шт"
+  expected: [{status: ambiguous, candidates: [48, 49]}]   # одинаковые названия; к-во 18/26 = гильзы 46/47 (фреон/дренаж?) — вопрос к работодателю
+
+# ───────────── Короба ─────────────
+- id: box-01
+  tags: [duct]
+  text: "металлический короб 150 на 60 — 6 метров"
+  expected: [{row: 29, qty: 6}]
+
+- id: box-02
+  tags: [duct]
+  text: "короб 90х60 12 м"
+  expected: [{row: 30, qty: 12}]
+
+- id: box-03
+  tags: [duct, units]
+  text: "кабель-канал 25 на 16 — 2 шт"
+  expected: [{row: 67, qty: 2}]
+
+- id: box-04
+  tags: [duct, units]
+  text: "короб 25х16 6 метров"
+  expected: [{status: clarify, row: 67}]   # в смете шт (по 2 м); 6 м = 3 шт? — спросить
+
+# ───────────── Оборудование ─────────────
+- id: eq-01
+  tags: [equipment]
+  text: "повесили внутряк К3.1"
+  expected: [{row: 8, qty: 1}]
+
+- id: eq-02
+  tags: [equipment]
+  text: "кассету 12-ю смонтировали"
+  expected: [{row: 11, qty: 1}]
+
+- id: eq-03
+  tags: [equipment, ambiguous]
+  text: "поставили наружный блок"
+  expected: [{status: ambiguous, candidates: [5, 7, 9, 14]}]
+
+- id: eq-04
+  tags: [equipment, ambiguous]
+  text: "внутренний блок MDSAI2-07 один"
+  expected: [{status: ambiguous, candidates: [10, 15]}]   # одна модель в системах К6 и К8
+
+- id: eq-05
+  tags: [equipment]
+  text: "дозаправили фреоном 0,5 кг"
+  expected: [{row: 28, qty: 0.5}]
+
+# ───────────── Электрика: работы и прочее ─────────────
+- id: el-01
+  tags: [electric]
+  text: "гофру 20-ку 100 метров"
+  expected: [{row: 64, qty: 100}]   # мастер называет ПВХ-трубу «гофрой»
+
+- id: el-02
+  tags: [electric]
+  text: "трубу пвх 25 — 30 м"
+  expected: [{row: 65, qty: 30}]
+
+- id: el-03
+  tags: [electric]
+  text: "щит учётный повесили"
+  expected: [{row: 54, qty: 1}]
+
+- id: el-04
+  tags: [electric]
+  text: "кабель на скобах 8 м проложили"
+  expected: [{row: 71, qty: 8}]   # строка 71 без № в колонке A
+
+# ───────────── Пусконаладка — разные единицы ─────────────
+- id: pnr-01
+  tags: [commissioning]
+  text: "пнр мультисплита 2 системы"
+  expected: [{row: 51, qty: 2}]
+
+# ───────────── Нет в смете / нет объёма ─────────────
+- id: nf-01
+  tags: [not_found]
+  text: "покрасили стену в коридоре 20 м2"
+  expected: [{status: not_found}]
+
+- id: nf-02
+  tags: [not_found]
+  text: "вынесли мусор"
+  expected: [{status: not_found}]   # любая работа вне сметы → not_found
+
+- id: qty-01
+  tags: [no_qty]
+  text: "медь 6-ку тянули"
+  expected: [{status: clarify, row: 17}]   # объём не назван — спросить
+
+# ───────────── Комбинированные отчёты ─────────────
+- id: mix-01
+  tags: [multi, reference]
+  text: "Сегодня проложили медь 6-ку 15 м и 9-ку 15 м, изоляцию на них столько же, кабель 3х2,5 — 56 м, поставили 10 хомутов под фреон"
+  expected:
+    - {row: 17, qty: 15}
+    - {row: 18, qty: 15}
+    - {row: 20, qty: 15}
+    - {row: 21, qty: 15}
+    - {row: 55, qty: 56}
+    - {row: 44, qty: 10}
+
+- id: mix-02
+  tags: [multi]
+  text: "шпилек 5, хомутов фреоновых 5, двенашки 45 и изоляции на неё 45"
+  expected:
+    - {row: 45, qty: 5}
+    - {row: 44, qty: 5}
+    - {row: 19, qty: 45}
+    - {row: 22, qty: 45}
+
+- id: mix-03
+  tags: [multi, ambiguous]
+  text: "гофры 20-ки 32 м, кабель 4 на полтора 24 и 3 на полтора 16, тройники 3 штуки"
+  expected:
+    - {row: 64, qty: 32}
+    - {row: 57, qty: 24}
+    - {row: 56, qty: 16}
+    - {status: ambiguous, candidates: [36, 37, 40]}   # какой тройник — неизвестно
+
+- id: mix-04
+  tags: [multi, voice_style]
+  text: "так значит э-э медь шестёрка двадцать пять метров девятка тоже двадцать пять ну и шпильки штук десять"
+  expected:
+    - {row: 17, qty: 25}
+    - {row: 18, qty: 25}
+    - {row: 45, qty: 10}
+
+- id: mix-05
+  tags: [multi, not_found]
+  text: "дренаж пп 8 м, штробили стену 2 часа"
+  expected:
+    - {row: 34, qty: 8}
+    - {status: not_found}

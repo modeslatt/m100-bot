@@ -1,0 +1,44 @@
+[project]
+name = "m100bot"
+version = "0.1.0"
+description = "Telegram-бот: дневной отчёт мастера → Google Sheets + Битрикс24"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.13",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "gspread>=6.1",
+    "httpx>=0.27",
+    "openai>=1.50",        # клиент для Ollama и облачных OpenAI-совместимых API
+    "rapidfuzz>=3.9",
+    "tenacity>=9.0",
+    "aiosqlite>=0.20",
+    "loguru>=0.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+voice = ["faster-whisper>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "openpyxl>=3.1", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/m100bot/matching/llm.py" = ["E501"]  # промпт читается лучше без переносов

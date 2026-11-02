@@ -1,0 +1,11 @@
+.env
+credentials.json
+*.sqlite3
+data/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+Тестовое задание AI-разработчик.pdf
