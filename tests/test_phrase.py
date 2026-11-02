@@ -2,7 +2,13 @@
 
 import pytest
 
-from m100bot.matching.phrase import Part, bare_numbers, find_quantities, split_by_features
+from m100bot.matching.phrase import (
+    Part,
+    bare_numbers,
+    find_quantities,
+    split_by_features,
+    synonym_key,
+)
 
 
 @pytest.mark.parametrize(
@@ -59,3 +65,21 @@ def test_bare_numbers() -> None:
     assert bare_numbers("медь на 1/2 дюйма 10 м", {10.0}) == []  # дробь и объём не считаем
     assert bare_numbers("переходной тройник 25-20-25 две штуки", {2.0}) == [25.0, 20.0]
     assert bare_numbers("покрасили стену 20 м2", {20.0}) == []
+
+
+@pytest.mark.parametrize(
+    ("phrase", "qty", "key"),
+    [
+        ("12 хомутов", 12, "хомутов"),
+        ("хомутов 12 штук", 12, "хомутов"),
+        ("поставили 12 хомутов", 12, "хомутов"),  # глагол не входит в ключ
+        ("хомуты — 12", 12, "хомуты"),
+        ("тройник 25 — 3 шт", 3, "тройник 25"),  # 25 — размер, он остаётся
+        ("медь 6-ку 15 м", 15, "медь 6-ку"),
+        ("проложили кабель-канал 25 на 16", None, "кабель-канал 25х16"),
+        ("смонтировали материал 3 шт", 3, "материал"),  # «-ал» — не глагол
+        ("", None, ""),
+    ],
+)
+def test_synonym_key(phrase: str, qty: float | None, key: str) -> None:
+    assert synonym_key(phrase, qty) == key

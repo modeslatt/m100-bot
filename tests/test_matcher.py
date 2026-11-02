@@ -192,3 +192,22 @@ def test_refresh_replaces_catalog_and_synonyms(catalog: Catalog) -> None:
     assert matcher.synonyms == {"гофра 20": 65}  # старые синонимы заменены, ключи нормализованы
     item = matcher.validate(m("кабель полторашку 30 м", [55], 30, "м"))
     assert item.candidates == [57, 60]  # варианты кабеля берутся уже без удалённой строки 56
+
+
+def test_learned_synonym_ignores_quantity(catalog: Catalog) -> None:
+    matcher = Matcher(catalog, FakeLlm(), synonyms={"хомутов": 44})
+    assert matcher._synonym_row("12 хомутов", 12) == 44
+    assert matcher._synonym_row("хомутов 5 штук", 5) == 44  # другая формулировка и объём
+    assert matcher._synonym_row("тройник 25", 3) is None  # чужая фраза не совпадает
+
+
+async def test_match_resolves_ambiguous_phrase_by_learned_synonym(catalog: Catalog) -> None:
+    llm = FakeLlm(m("поставили 12 хомутов", [43, 44], 12, "шт"))
+    items = await Matcher(catalog, llm, synonyms={"хомутов": 44}).match("поставили 12 хомутов")
+    assert [(i.status, i.row, i.qty) for i in items] == [(MatchStatus.OK, 44, 12)]
+
+
+async def test_match_keeps_remaining_with_over_flag(catalog: Catalog) -> None:
+    llm = FakeLlm(m("медь 6-ка 15 м", [17], 15, "м"))
+    [item] = await Matcher(catalog, llm).match("…", remaining={17: 10})
+    assert (item.over_remaining, item.remaining) == (True, 10)

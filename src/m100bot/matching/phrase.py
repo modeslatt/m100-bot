@@ -61,6 +61,33 @@ def distributive_qty(text: str) -> float | None:
     return None
 
 
+_PAST_PLURAL = re.compile(r"[а-я]{5,}(?:ли|ла)")
+
+
+def synonym_key(phrase: str, qty: float | None = None) -> str:
+    """Фраза без объёма — ключ синонима: «12 хомутов» и «хомутов 12 штук» → «хомутов».
+
+    Убираем «число + единица», голое число, равное объёму, и глаголы прошедшего времени
+    во множественном числе («проложили», «смонтировали»): LLM вырезает фрагмент фразы
+    по-разному, а ключ должен получаться один и тот же. Остальные числа остаются: в
+    «тройник 25» это размер, и «тройник 25» не должен совпасть с просто «тройник».
+    Только формы «-ли/-ла»: «-ал/-ил» задели бы «кабель-канал» и «материал».
+    """
+    t = normalize_text(phrase)
+    for q in sorted(find_quantities(t), key=lambda q: -q.start):
+        t = t[: q.start] + " " + t[q.end :]
+    if qty is not None:
+        tokens = t.split()
+        for i, tok in enumerate(tokens):
+            if re.fullmatch(r"\d+(?:\.\d+)?", tok) and float(tok) == float(qty):
+                del tokens[i]
+                break
+        t = " ".join(tokens)
+    t = re.sub(r"[—–\-]+(?=\s|$)|(?<=^)[—–\-]+", " ", t)
+    tokens = [tok for tok in t.split() if not _PAST_PLURAL.fullmatch(tok)]
+    return " ".join(tokens).strip(" ,.;:")
+
+
 # ─────────────── Слова ───────────────
 
 _WORD = re.compile(r"[a-zа-я]+")

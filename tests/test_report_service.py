@@ -36,6 +36,8 @@ class FakeSheets:
         self.done_error: Exception | None = None
         self.synonyms_error: Exception | None = None
         self.writes: list[tuple[date, dict[int, float], str]] = []
+        self.added_synonyms: list[tuple[str, int]] = []
+        self.synonym_error: Exception | None = None
         self.calls: Counter[str] = Counter()
 
     async def load_catalog(self) -> Catalog:
@@ -49,6 +51,12 @@ class FakeSheets:
         if self.synonyms_error:
             raise self.synonyms_error
         return self.synonyms
+
+    async def add_synonym(self, phrase: str, row: int) -> None:
+        self.calls["add_synonym"] += 1
+        if self.synonym_error:
+            raise self.synonym_error
+        self.added_synonyms.append((phrase, row))
 
     async def read_done(self, rows: Iterable[int]) -> dict[int, float]:
         self.calls["read_done"] += 1

@@ -41,3 +41,5 @@ class MatchedItem(BaseModel):
     candidates: list[int] = []  # варианты для кнопок при AMBIGUOUS
     message: str | None = None  # что сказать мастеру (почему уточняем)
     over_remaining: bool = False  # объём больше остатка по смете
+    remaining: float | None = None  # сколько осталось по смете (для «осталось 12 м»)
+    picked: bool = False  # вариант выбрал мастер кнопкой — после записи запомним как синоним

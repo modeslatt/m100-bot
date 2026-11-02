@@ -265,3 +265,18 @@ def test_fold_zero_drops_the_row() -> None:
 
 def test_fold_rounds_float_noise() -> None:
     assert fold_writes([NewWrite(17, 0.1, "add", 0), NewWrite(17, 0.2, "add", 0.1)]) == {17: 0.3}
+
+
+async def test_draft_token_follows_content(storage: Storage) -> None:
+    await storage.save_draft(1, "текст", [item(17, 15)])
+    first = await storage.get_draft(1)
+    await storage.save_draft(1, "текст", [item(17, 15)])  # то же самое — тот же отпечаток
+    same = await storage.get_draft(1)
+    await storage.save_draft(1, "текст", [item(17, 16)])
+    changed = await storage.get_draft(1)
+    await storage.save_draft(1, "другой текст", [item(17, 15)])
+    other_text = await storage.get_draft(1)
+
+    assert first and same and changed and other_text
+    assert first.token == same.token and len(first.token) == 8
+    assert len({first.token, changed.token, other_text.token}) == 3

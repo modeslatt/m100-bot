@@ -23,6 +23,7 @@ from m100bot.matching.phrase import (
     bare_numbers,
     find_quantities,
     split_by_features,
+    synonym_key,
     words,
 )
 from m100bot.sheets.catalog import Catalog, Position
@@ -302,7 +303,7 @@ class Matcher:
         items: list[MatchedItem] = []
         for mention in mentions:
             for part in self._split(mention):
-                row = self._synonym_row(part.phrase)
+                row = self._synonym_row(part.phrase, part.qty)
                 items.append(self.validate(part, synonym_row=row, message_words=message_words))
         items = self._resolve_references(items)
 
@@ -311,6 +312,7 @@ class Matcher:
                 if item.row is not None and item.qty is not None:
                     left = remaining.get(item.row)
                     item.over_remaining = left is not None and item.qty > left + 1e-9
+                    item.remaining = left
         logger.info(
             "match: {} позиций: {}",
             len(items),
@@ -412,12 +414,13 @@ class Matcher:
             for r in picks
         ]
 
-    def _synonym_row(self, phrase: str) -> int | None:
+    def _synonym_row(self, phrase: str, qty: float | None = None) -> int | None:
+        """Точное совпадение фразы (с объёмом и без него) с листом «Синонимы»."""
         if not self.synonyms:
             return None
         key = normalize_text(phrase)
-        for k in (key, _TRAILING_QTY.sub("", key)):
-            if k in self.synonyms:
+        for k in (key, _TRAILING_QTY.sub("", key), synonym_key(phrase, qty)):
+            if k and k in self.synonyms:
                 return self.synonyms[k]
         return None
 

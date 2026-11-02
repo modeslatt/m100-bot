@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
@@ -65,6 +66,16 @@ class Draft:
     source_text: str
     items: list[MatchedItem]
     updated_at: str
+
+    @property
+    def token(self) -> str:
+        """Короткий отпечаток содержимого черновика.
+
+        Он зашит в кнопки карточки. Черновик изменился (новый отчёт, правка) — отпечаток
+        другой, и кнопка со старой карточки ничего не запишет. Хранить версию не нужно.
+        """
+        raw = self.source_text + _ITEMS.dump_json(self.items).decode()
+        return hashlib.sha1(raw.encode()).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
