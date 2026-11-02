@@ -15,6 +15,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "loguru>=0.7",
     "pyyaml>=6.0",
+    "tzdata>=2024.1; sys_platform == 'win32'",  # на Windows нет базы часовых поясов для zoneinfo
 ]
 
 [project.optional-dependencies]

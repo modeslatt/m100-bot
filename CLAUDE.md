@@ -52,7 +52,9 @@ src/m100bot/
   config.py            pydantic-settings, всё из .env
   __main__.py          точка входа: python -m m100bot
   sheets/catalog.py    парсинг справочника и столбцов дат из «сырых» строк (без сети) ✅ готово
-  sheets/client.py     gspread: чтение листа, поиск/создание столбца даты, batch-запись
+  sheets/addressing.py  адреса ячеек, план столбца даты, формулы SUM, запросы batchUpdate ✅ готово
+  sheets/client.py     gspread: чтение листа, поиск/создание столбца даты, batch-запись ✅ готово
+                       (проверено на имитации; на живой таблице — scripts/try_sheets.py)
   matching/normalize.py нормализация текста и чисел ✅ готово
   matching/features.py  признаки из названий: диаметр, сечение, ток, размер, модель ✅ готово
   matching/llm.py       вызов LLM (локальная Ollama, JSON-схема) → черновые позиции

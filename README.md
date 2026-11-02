@@ -24,9 +24,19 @@ python -m m100bot
 | `LLM_BASE_URL`, `LLM_MODEL` | локальная Ollama: установить с ollama.com, `ollama pull qwen3:8b`, задать переменную `OLLAMA_CONTEXT_LENGTH=8192` |
 | `STT_MODEL` | локальный faster-whisper: `pip install -e ".[voice]"`, модель `small` (быстро) или `medium` (точнее) |
 | `GOOGLE_CREDENTIALS_FILE` | Google Cloud → сервисный аккаунт → JSON-ключ; включить Sheets API; расшарить таблицу на e-mail аккаунта |
-| `SPREADSHEET_ID` | часть URL таблицы между `/d/` и `/edit` |
+| `SPREADSHEET_ID` | часть URL таблицы между `/d/` и `/edit`. Таблица должна быть **Google Таблицей**: если загружен `.xlsx`, откройте его в Drive → «Файл → Сохранить как Google Таблицы» и возьмите ID новой |
 | `BITRIX_WEBHOOK_URL` | Битрикс24 → Разработчикам → Другое → Входящий вебхук (права: crm) |
 | `BITRIX_ENTITY_TYPE_ID` | ID смарт-процесса «Дневной отчёт» |
+
+### Проверка подключения к таблице
+
+```powershell
+python scripts/try_sheets.py          # только чтение: справочник, план — ничего не меняет
+python scripts/try_sheets.py --write  # создаст столбец даты, запишет 1 в строку 17, прочитает обратно
+```
+
+`--write` меняет таблицу — запускайте на копии. Скрипт заодно проверяет, что формула
+«Выполненный объем» (`=SUM(J:CZ)`) учла новый столбец.
 
 ## Подход
 

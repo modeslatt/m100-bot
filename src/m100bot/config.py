@@ -2,9 +2,10 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class LlmSettings(BaseSettings):
@@ -27,10 +28,26 @@ class LlmSettings(BaseSettings):
     llm_fallback_model: str = ""
 
 
-class Settings(LlmSettings):
+class SheetsSettings(BaseSettings):
+    """Только Google Sheets — нужны скриптам без токена бота и LLM."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    google_credentials_file: Path = Path("credentials.json")
+    spreadsheet_id: str
+    worksheet_name: str = "Лист1"
+    synonyms_worksheet_name: str = "Синонимы"
+
+    @property
+    def spreadsheet_url(self) -> str:
+        return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/edit"
+
+
+class Settings(LlmSettings, SheetsSettings):
     # Telegram
     bot_token: str
-    allowed_user_ids: list[int] = []
+    # NoDecode: иначе pydantic-settings читает пустое «ALLOWED_USER_IDS=» как JSON и падает
+    allowed_user_ids: Annotated[list[int], NoDecode] = []
 
     # Speech-to-text
     stt_provider: str = "local"  # local (faster-whisper) | api (OpenAI-совместимый)
@@ -38,12 +55,6 @@ class Settings(LlmSettings):
     stt_device: str = "cpu"
     stt_base_url: str = ""
     stt_api_key: str = ""
-
-    # Google Sheets
-    google_credentials_file: Path = Path("credentials.json")
-    spreadsheet_id: str
-    worksheet_name: str = "Лист1"
-    synonyms_worksheet_name: str = "Синонимы"
 
     # Bitrix24
     bitrix_webhook_url: str = ""
@@ -65,10 +76,6 @@ class Settings(LlmSettings):
     @classmethod
     def _empty_to_none(cls, v: object) -> object:
         return None if v == "" else v
-
-    @property
-    def spreadsheet_url(self) -> str:
-        return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/edit"
 
 
 @lru_cache
