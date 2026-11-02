@@ -258,14 +258,22 @@ class Matcher:
         *,
         expand_siblings: bool = True,
     ) -> None:
-        self.catalog = catalog
         self.llm = llm
+        self.expand_siblings = expand_siblings
+        self.refresh(catalog, synonyms)
+
+    def refresh(self, catalog: Catalog, synonyms: dict[str, int] | None = None) -> None:
+        """Подставить свежий справочник и синонимы (после перечитывания таблицы).
+
+        Бот живёт долго, а таблицу правят: без этого новые позиции появились бы
+        только после перезапуска.
+        """
+        self.catalog = catalog
         # нормализованная фраза (без объёма) → строка
         self.synonyms = {normalize_text(k): v for k, v in (synonyms or {}).items()}
         # «варианты одного товара»: позиции с одинаковым первым словом и ед. изм.
         # (все кабели, все хомуты, все внутренние блоки). LLM часто находит товар,
         # но ошибается в варианте — нужный вариант код выбирает по признакам.
-        self.expand_siblings = expand_siblings
         self._groups: dict[tuple[str, str], list[Position]] = {}
         for p in catalog.positions:
             if key := self._group_key(p):

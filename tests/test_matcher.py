@@ -177,3 +177,18 @@ async def test_no_reask_when_complete(catalog: Catalog) -> None:
     llm = SequenceLlm([m("кабель 3х2,5 — 56 м", [55], 56, "м")])
     await Matcher(catalog, llm).match("кабель 3х2,5 — 56 м")
     assert len(llm.texts) == 1
+
+
+def test_refresh_replaces_catalog_and_synonyms(catalog: Catalog) -> None:
+    """Бот живёт долго, таблицу правят: после refresh матчер работает по новому справочнику."""
+    matcher = Matcher(catalog, FakeLlm(), synonyms={"гофра": 64})
+    smaller = Catalog(
+        [p for p in catalog.positions if p.row != 56], catalog.date_columns, catalog.last_col
+    )
+
+    matcher.refresh(smaller, {"ГОФРА  20": 65})
+
+    assert matcher.catalog is smaller
+    assert matcher.synonyms == {"гофра 20": 65}  # старые синонимы заменены, ключи нормализованы
+    item = matcher.validate(m("кабель полторашку 30 м", [55], 30, "м"))
+    assert item.candidates == [57, 60]  # варианты кабеля берутся уже без удалённой строки 56
