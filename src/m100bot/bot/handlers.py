@@ -29,6 +29,7 @@ from m100bot.bot.keyboards import (
     qty_question_keyboard,
     review_keyboard,
     sheet_link_keyboard,
+    stale_draft_keyboard,
     today_item_keyboard,
     today_keyboard,
     today_pick_keyboard,
@@ -222,29 +223,84 @@ async def on_other(message: Message) -> None:
 async def process_report(
     message: Message, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
-    """Текст мастера → карточка. Прежний черновик заменяется, а если работ не нашлось — остаётся."""
+    """Текст мастера → карточка.
+
+    Незаписанного отчёта нет — начинаем новый. Есть сегодняшний — дописываем в него:
+    мастер часто присылает работы по одной, и молча стирать прежние нельзя. Есть
+    вчерашний (или старше) — спрашиваем, дописать в него или начать новый.
+    """
     if message.from_user is None or not message.text:
         return
     uid, chat_id = message.from_user.id, message.chat.id
-    old = await state.get_data()
+    draft = await service.get_draft(uid)
+    if draft is not None and service.draft_day(draft) != service.today():
+        await ask_about_stale_draft(message, state, service, draft)
+        return
     placeholder = await message.answer(render.THINKING)
+    await recognize_into_card(
+        bot,
+        chat_id,
+        service,
+        state,
+        uid,
+        message.text,
+        placeholder.message_id,
+        append=draft is not None,
+    )
+
+
+async def recognize_into_card(
+    bot: Bot,
+    chat_id: int,
+    service: ReportService,
+    state: FSMContext,
+    uid: int,
+    text: str,
+    placeholder_id: int,
+    *,
+    append: bool,
+    token: str | None = None,
+) -> None:
+    """Распознать текст (дописать в черновик или начать новый) и показать карточку на месте
+    placeholder_id. Работ не нашлось — прежний черновик и карточка остаются как были."""
+    old = await state.get_data()
     try:
-        items = await service.recognize(uid, message.text)
+        if append:
+            _, found = await service.append(uid, text, token=token)
+        else:
+            found = len(await service.recognize(uid, text))
+    except StaleCardError:
+        raise  # кнопка со старой карточки — разберётся guarded()
     except USER_ERRORS as e:
-        await edit_or_send(bot, chat_id, placeholder.message_id, str(e))
+        await edit_or_send(bot, chat_id, placeholder_id, str(e))
         return
     except Exception:
         logger.exception("Не удалось разобрать отчёт")
-        await edit_or_send(bot, chat_id, placeholder.message_id, render.FAILED)
+        await edit_or_send(bot, chat_id, placeholder_id, render.FAILED)
         return
-    if not items:
-        await edit_or_send(bot, chat_id, placeholder.message_id, render.NOTHING_FOUND)
+    if not found:
+        await edit_or_send(bot, chat_id, placeholder_id, render.NOTHING_FOUND)
         return
-    # новый черновик: старая карточка и вопрос больше не действуют
+    # карточка будет новая: у старой убираем кнопки, открытый вопрос задаём заново
     await strip_keyboard(bot, chat_id, old.get("card_id"))
     await delete_quietly(bot, chat_id, old.get("question_id"))
     await state.clear()
-    await refresh(bot, chat_id, service, state, uid, card_id=placeholder.message_id)
+    await refresh(bot, chat_id, service, state, uid, card_id=placeholder_id)
+
+
+async def ask_about_stale_draft(
+    message: Message, state: FSMContext, service: ReportService, draft: Draft
+) -> None:
+    """Незаписанный отчёт за прошлый день: текст откладываем, мастер решает кнопкой."""
+    n = len(draft.items)
+    text = render.STALE_DRAFT.format(
+        day=service.draft_day(draft),
+        n=n,
+        word=render.plural(n, ("позиция", "позиции", "позиций")),
+    )
+    await state.set_state(None)
+    await state.update_data(pending_text=message.text)
+    await message.answer(text, reply_markup=stale_draft_keyboard(draft.token))
 
 
 async def on_report(message: Message, state: FSMContext, bot: Bot, service: ReportService) -> None:
@@ -471,7 +527,32 @@ async def card_cancel(t: Tap, cb: Act) -> None:
     await t.state.clear()
 
 
+async def _pending_into_card(t: Tap, cb: Act, *, append: bool) -> None:
+    """Отложенный текст (см. ask_about_stale_draft) → в старый отчёт или в новый."""
+    text = t.data.get("pending_text")
+    if not text:
+        raise StaleCardError("Эта карточка устарела. Пришлите отчёт заново.")
+    await t.service.get_draft(t.uid, token=cb.t)  # черновик с тех пор не меняли
+    await t.state.update_data(pending_text=None)
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.THINKING)
+    await recognize_into_card(
+        t.bot, t.chat_id, t.service, t.state, t.uid, text, t.msg_id, append=append, token=cb.t
+    )
+
+
+async def card_merge(t: Tap, cb: Act) -> None:
+    """«Добавить к нему»: новое сообщение — во вчерашний незаписанный отчёт."""
+    await _pending_into_card(t, cb, append=True)
+
+
+async def card_fresh(t: Tap, cb: Act) -> None:
+    """«Новый отчёт»: старый незаписанный отчёт заменяется новым."""
+    await _pending_into_card(t, cb, append=False)
+
+
 CARD_ACTIONS: dict[CardAction, Callable[[Tap, Act], Awaitable[None]]] = {
+    "merge": card_merge,
+    "fresh": card_fresh,
     "ok": card_ok,
     "edit": card_edit,
     "item": card_item,

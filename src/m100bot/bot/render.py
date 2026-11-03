@@ -37,6 +37,10 @@ EDIT_PICK = "Какую позицию исправить?"
 BAD_NUMBER = "Не понял число. Пришлите цифрами, например: 12 или 7,5."
 FAILED = "Что-то пошло не так. Попробуйте ещё раз."
 TABLE_TEXT = "Таблица с объёмами."
+STALE_DRAFT = (
+    "Есть незаписанный отчёт за {day:%d.%m.%Y} ({n} {word}). "
+    "Добавить новое сообщение к нему или начать новый отчёт?"
+)
 MAX_TEXT = 3800  # лимит Telegram — 4096 знаков; оставляем запас
 
 _UNIT_WORDS = {
@@ -164,11 +168,13 @@ class Question:
     kind: Literal["choice", "qty"]
     idx: int
     text: str
-    options: list[tuple[int, str]]  # для choice: (строка таблицы, подпись кнопки)
+    options: list[tuple[int, str]]  # для choice: (строка таблицы, полное название варианта)
 
 
 def choice_options(item: MatchedItem, catalog: Catalog) -> list[tuple[int, str]]:
-    """Подписи кнопок. Одинаковые названия (строки 48/49) различаем № и количеством по смете."""
+    """Варианты для вопроса — полными названиями (в кнопку они не влезают, поэтому стоят
+    списком в тексте, а на кнопках — номера). Одинаковые названия (строки 48/49) различаем
+    № и количеством по смете."""
     positions = [p for r in item.candidates if (p := catalog.by_row(r)) is not None]
     names = Counter(p.short_name for p in positions)
     options = []
@@ -176,11 +182,8 @@ def choice_options(item: MatchedItem, catalog: Catalog) -> list[tuple[int, str]]
         name = p.short_name
         if names[name] > 1:
             num = p.number if p.number is not None else p.row
-            suffix = f" · № {num}, по смете {fmt_qty(p.planned)} {p.unit}"
-            label = name[: max(60 - len(suffix), 10)] + suffix
-        else:
-            label = name[:60]
-        options.append((p.row, label))
+            name += f" · № {num}, по смете {fmt_qty(p.planned)} {p.unit}"
+        options.append((p.row, name))
     return options
 
 
@@ -190,7 +193,9 @@ def question_for(items: list[MatchedItem], idx: int, catalog: Catalog) -> Questi
     if needs_choice(item):
         options = choice_options(item, catalog)
         if len(options) >= 2:
-            return Question("choice", idx, f"Позиция {n}: «{item.phrase}». Какой вариант?", options)
+            listing = "\n".join(f"{k}. {name}" for k, (_, name) in enumerate(options, start=1))
+            text = f"Позиция {n}: «{item.phrase}». Какой вариант?\n\n{listing}"
+            return Question("choice", idx, text, options)
         return None
     if needs_qty(item):
         pos = _pos(item, catalog)

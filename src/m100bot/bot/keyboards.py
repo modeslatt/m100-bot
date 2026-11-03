@@ -13,7 +13,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from m100bot.services.report import TodayLine
 
-CardAction = Literal["ok", "edit", "add", "cancel", "back", "item", "del", "qdel", "pick"]
+CardAction = Literal[
+    "ok", "edit", "add", "cancel", "back", "item", "del", "qdel", "pick", "merge", "fresh"
+]
 TodayAction = Literal["edit", "row", "clear", "back"]
 
 
@@ -49,11 +51,22 @@ def review_keyboard(token: str, n_ready: int, n_unresolved: int) -> InlineKeyboa
 
 
 def choice_keyboard(token: str, idx: int, options: list[tuple[int, str]]) -> InlineKeyboardMarkup:
-    """Варианты для неоднозначной позиции: (строка таблицы, подпись)."""
+    """Варианты для неоднозначной позиции. Полные названия — списком в тексте вопроса,
+    на кнопках только номера: длинное название в кнопке Telegram обрезает."""
     kb = InlineKeyboardBuilder()
-    for row, label in options:
-        kb.button(text=label, callback_data=Act(a="pick", t=token, i=idx, r=row))
+    for n, (row, _) in enumerate(options, start=1):
+        kb.button(text=str(n), callback_data=Act(a="pick", t=token, i=idx, r=row))
     kb.button(text="Нет нужного", callback_data=Act(a="pick", t=token, i=idx, r=0))
+    k = len(options)
+    kb.adjust(*([5] * (k // 5)), *([k % 5] if k % 5 else []), 1)
+    return kb.as_markup()
+
+
+def stale_draft_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Вчерашний незаписанный отчёт: дописать в него или начать новый."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить к нему", callback_data=Act(a="merge", t=token))
+    kb.button(text="🆕 Новый отчёт", callback_data=Act(a="fresh", t=token))
     kb.adjust(1)
     return kb.as_markup()
 

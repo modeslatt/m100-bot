@@ -128,7 +128,8 @@ class ReportService:
         self.storage = storage
         self.matcher = matcher
         self.bitrix = bitrix  # None — Битрикс не настроен: в outbox ничего не кладём
-        self._today = today or (lambda: datetime.now(ZoneInfo(timezone)).date())
+        self._tz = ZoneInfo(timezone)
+        self._today = today or (lambda: datetime.now(self._tz).date())
         self._clock = clock
         self._recognize_budget_s = recognize_budget_s
         self._user_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -141,6 +142,13 @@ class ReportService:
 
     def today(self) -> date:
         return self._today()
+
+    def draft_day(self, draft: Draft) -> date:
+        """День, когда черновик последний раз меняли (по часовому поясу объекта).
+
+        Новое сообщение дописывается в сегодняшний черновик; про вчерашний бот спрашивает.
+        """
+        return datetime.fromisoformat(draft.updated_at).astimezone(self._tz).date()
 
     async def catalog(self) -> Catalog:
         """Справочник для показа названий; сбой таблицы → ReportError с текстом для мастера."""

@@ -6,7 +6,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,7 @@ from m100bot.sheets.client import SheetsError
 from m100bot.storage.db import Storage
 
 D = date(2026, 11, 2)
+NOW = datetime(2026, 11, 2, 9, tzinfo=UTC)  # 12:00 по Минску
 HTTPS = "https://sheet.test/edit#range=B"
 
 
@@ -60,7 +61,8 @@ class Env:
 
 
 async def make_env(tmp_path: Path, catalog: Catalog, allowed: tuple[int, ...] = ()) -> Env:
-    storage = Storage(tmp_path / "bot.sqlite3")
+    # черновики «создаются» в тот же день, что и сегодняшняя дата бота
+    storage = Storage(tmp_path / "bot.sqlite3", now=lambda: NOW)
     await storage.init()
     sheets, matcher, bitrix = FakeSheets(catalog), FakeMatcher(), FakeBitrix()
     service = ReportService(sheets, storage, matcher, bitrix, today=lambda: D)
@@ -226,21 +228,21 @@ async def test_ambiguous_items_are_asked_one_at_a_time(env: Env) -> None:
     questions = [m for m in env.chat.visible() if m.text.startswith("Позиция")]
     assert len(questions) == 1  # вопрос только один
     q1 = questions[0]
-    assert q1.text == "Позиция 2: «12 хомутов». Какой вариант?"
-    assert q1.labels == [
-        "Хомут для крепления дренажа М8 25мм",
-        "Хомут для крепления фреонопровода М8 32 мм",
-        "Нет нужного",
-    ]
+    assert q1.text == (
+        "Позиция 2: «12 хомутов». Какой вариант?\n\n"
+        "1. Хомут для крепления дренажа М8 25мм\n"
+        "2. Хомут для крепления фреонопровода М8 32 мм"
+    )
+    assert q1.labels == ["1", "2", "Нет нужного"]  # полные названия — в тексте
 
-    await env.chat.press(q1.id, "Хомут для крепления фреонопровода")
+    await env.chat.press(q1.id, "2")
 
     assert q1.deleted
     assert "2. ✅ Хомут для крепления фреонопровода М8 32 мм — 12 шт" in card.text
     q2 = env.chat.find("Позиция 3:")
     # у строк 48 и 49 одинаковые названия: различаются № и количеством по смете
-    assert q2.labels[0].endswith("· № 44, по смете 18 шт")
-    assert q2.labels[1].endswith("· № 45, по смете 26 шт")
+    assert "1. сверление отверстий Д80 L=0,5м · № 44, по смете 18 шт" in q2.text
+    assert "2. сверление отверстий Д80 L=0,5м · № 45, по смете 26 шт" in q2.text
 
     await env.chat.press(q2.id, "Нет нужного")
 
@@ -252,7 +254,7 @@ async def test_ambiguous_items_are_asked_one_at_a_time(env: Env) -> None:
 async def test_picked_variant_is_learned_as_synonym_only_after_writing(env: Env) -> None:
     card = await report(env, amb("12 хомутов", 12, [43, 44]))
     q = env.chat.find("Позиция 1:")
-    await env.chat.press(q.id, "Хомут для крепления фреонопровода")
+    await env.chat.press(q.id, "2")  # хомут для фреонопровода
     await env.service.drain()
     assert env.sheets.added_synonyms == []  # пока не записано — не запоминаем
 
@@ -293,7 +295,7 @@ async def test_confirm_with_unresolved_keeps_them_and_asks_again(env: Env) -> No
     new_card = env.chat.card()
     assert new_card.id != card.id
     assert "Распознано 1 позиция, 1 нужно уточнить." in new_card.text
-    assert env.chat.find("Позиция 1:").labels[0].startswith("Хомут для крепления дренажа")
+    assert "1. Хомут для крепления дренажа" in env.chat.find("Позиция 1:").text
     draft = await env.storage.get_draft(1)
     assert draft is not None and [i.phrase for i in draft.items] == ["12 хомутов"]
 
@@ -333,13 +335,57 @@ async def test_other_units_question(env: Env) -> None:
     assert "1. ✅ Короб ПВХ размером 25х16мм, длиной 2м — 3 шт" in card.text
 
 
-async def test_long_text_instead_of_number_is_a_new_report(env: Env) -> None:
-    await report(env, clarify_qty(17))
+async def test_long_text_instead_of_number_is_added_to_report(env: Env) -> None:
+    """Бот ждёт «сколько?», а мастер присылает следующую работу: дописываем, не стираем."""
+    old_card = await report(env, clarify_qty(17))
     env.matcher.items = [ok(18, 7)]
     await env.chat.say("проложили девятку семь метров")
     card = env.chat.card()
-    assert "2. " not in card.text and "Д9,52" in card.text
-    assert not [m for m in env.chat.visible() if m.text.startswith("Позиция")]
+    assert "1. ❓ Фреонопровод медный, Д6,35 TEC TUBE cips — сколько?" in card.text
+    assert "2. ✅ Фреонопровод медный, Д9,52 TEC TUBE cips — 7 м" in card.text
+    assert old_card.buttons == []  # у прежней карточки кнопки убраны
+    # вопрос по первой позиции задан заново и по-прежнему ждёт число
+    assert env.chat.find("Позиция 1:")
+    await env.chat.say("15")
+    assert "1. ✅ Фреонопровод медный, Д6,35 TEC TUBE cips — 15 м" in card.text
+
+
+async def test_messages_one_by_one_are_collected_in_one_report(env: Env) -> None:
+    """Мастер шлёт работы по одной без кнопки «Добавить» — ни одна не теряется."""
+    await report(env, ok(17, 15))
+    for item in (ok(18, 10), amb("хомуты", 12, [43, 44]), ok(64, 40), ok(62, 1)):
+        env.matcher.items = [item]
+        await env.chat.say("ещё работа")
+    draft = await env.storage.get_draft(1)
+    assert draft is not None
+    assert [i.row or i.candidates for i in draft.items] == [17, 18, [43, 44], 64, 62]
+    assert "Распознано 5 позиций, 1 нужно уточнить." in env.chat.card().text
+
+
+async def test_yesterdays_draft_is_not_mixed_in_silently(env: Env) -> None:
+    await report(env, ok(17, 15))
+    env.service._today = lambda: date(2026, 11, 3)  # наступил следующий день
+    env.matcher.items = [ok(64, 40)]
+    await env.chat.say("гофра 20 — 40 м")
+
+    q = env.chat.find("Есть незаписанный отчёт за 02.11.2026 (1 позиция).")
+    assert q.labels == ["➕ Добавить к нему", "🆕 Новый отчёт"]
+    assert env.matcher.seen[-1][0] != "гофра 20 — 40 м"  # пока не распознавали
+
+    await env.chat.press(q.id, "🆕 Новый отчёт")
+    draft = await env.storage.get_draft(1)
+    assert draft is not None and [i.row for i in draft.items] == [64]
+    assert q.text.startswith("Отчёт за 03.11.2026. Распознано 1 позиция.")
+
+
+async def test_yesterdays_draft_can_be_continued(env: Env) -> None:
+    await report(env, ok(17, 15))
+    env.service._today = lambda: date(2026, 11, 3)
+    env.matcher.items = [ok(64, 40)]
+    await env.chat.say("гофра 20 — 40 м")
+    await env.chat.press(env.chat.find("Есть незаписанный отчёт").id, "➕ Добавить к нему")
+    draft = await env.storage.get_draft(1)
+    assert draft is not None and [i.row for i in draft.items] == [17, 64]
 
 
 # ─────────────── Исправить / Добавить / Отмена ───────────────

@@ -127,7 +127,17 @@ def test_choice_labels_separate_identical_names(catalog: Catalog) -> None:
     assert [row for row, _ in q.options] == [48, 49]  # по порядку строк
     first, second = (label for _, label in q.options)
     assert first.endswith("· № 44, по смете 18 шт") and second.endswith("· № 45, по смете 26 шт")
-    assert all(len(label) <= 60 for label in (first, second))
+
+
+def test_choice_question_lists_full_names(catalog: Catalog) -> None:
+    """Длинные названия кнопка обрезает — поэтому полный список стоит в тексте вопроса."""
+    q = render.question_for([amb([43, 44])], 0, catalog)
+    assert q is not None
+    assert q.text.endswith(
+        "Какой вариант?\n\n"
+        "1. Хомут для крепления дренажа М8 25мм\n"
+        "2. Хомут для крепления фреонопровода М8 32 мм"
+    )
 
 
 def test_no_question_for_resolved_items(catalog: Catalog) -> None:
