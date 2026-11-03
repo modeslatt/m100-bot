@@ -6,7 +6,6 @@ LLM только предлагает кандидатов; окончатель
 from __future__ import annotations
 
 import copy
-import re
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +20,6 @@ from tenacity import (
 )
 
 from m100bot.matching.models import LlmResponse
-from m100bot.matching.normalize import normalize_text
 from m100bot.sheets.catalog import Catalog
 
 if TYPE_CHECKING:
@@ -74,51 +72,8 @@ SYSTEM_PROMPT = """\
 """
 
 
-# Шаблонный текст спецификаций, который не различает позиции: стандарты, горючесть,
-# электрические параметры, напряжение кабеля. Это общие правила, а не список позиций.
-# Различающие признаки (Д, Ф, сечение, Iр, размеры, модели, б=) не трогаем —
-# tests/test_llm.py проверяет, что признаки короткого названия совпадают с полным.
-_NOISE_RX = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"марка\s+меди\s+\S+",
-        r"\bпо\s+(?:EN|ГОСТ|ТУ|DIN|ISO)\s*[\w.\-–]+",
-        r"(?:класс|групп)\w*\s+горючести\s+[ГгKК]\d",
-        r"\bс\s+(?:[а-я]+\s+)?(?:и\s+[а-я]+\s+)?расцепител\w*",
-        r"\b(?:G|H|N|U[нn]?|I[нn])\s*=\s*[\d.,]+\s*[^\s,]*",
-        r"\bхарактеристик\w*\s*\"?[A-ZА-Я]\"?",
-        r"(?<=[\s,])\dп\b",
-        r"\bемкость\s+[\d,.]+\s*л",
-        r"(?<![/\d])\b\d{3}\s*В\b",
-        r"\s*-\s*0[.,]66:?",
-        r"\bсечением,?(?:\s*мм²)?",
-        r"\bиз\s+вспененного\s+полиэтилена",
-        r"\bс\s+медными\s+жилами\b",
-    )
-]
-# Слово из букв со смешанными алфавитами — OCR-мусор («Tpyбoпpoвод», «Сберленuе»).
-# Только буквы и от 4 символов: «Iр=16А» и модели с цифрами («MDCAС4I») не трогаем.
-_MIXED_WORD = re.compile(
-    r"(?<![\w-])(?=[a-zA-Zа-яА-ЯёЁ]{4,}(?![\w-]))"
-    r"[a-zA-Zа-яА-ЯёЁ]*(?:[a-zA-Z][а-яА-ЯёЁ]|[а-яА-ЯёЁ][a-zA-Z])[a-zA-Zа-яА-ЯёЁ]*"
-)
-
-
-def compact_name(name: str) -> str:
-    """Короткое название для промпта: без шаблонного текста и с исправленным OCR-мусором."""
-    s = name
-    for rx in _NOISE_RX:
-        s = rx.sub(" ", s)
-    s = _MIXED_WORD.sub(lambda m: normalize_text(m.group(0)), s)
-    s = re.sub(r"(?i)сберлен", "сверлен", s)
-    s = re.sub(r"\s*,\s*(?:,\s*)+", ", ", s)
-    s = re.sub(r"\s+([,.:;])", r"\1", s)
-    s = re.sub(r"\s+", " ", s).strip(" ,.;:")
-    return re.sub(r"\s+шт$", "", s)  # «… Aspen шт» — ед. изм. и так в отдельной колонке
-
-
 def format_catalog(catalog: Catalog) -> str:
-    return "\n".join(f"{p.row}|{compact_name(p.name)}|{p.unit}" for p in catalog.positions)
+    return "\n".join(f"{p.row}|{p.short_name}|{p.unit}" for p in catalog.positions)
 
 
 class LlmError(RuntimeError):

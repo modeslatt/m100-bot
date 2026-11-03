@@ -5,17 +5,22 @@
 Эмодзи на кнопках — как были в заготовке: ✅ ✏️ ➕ ✖️ 📊.
 """
 
+from typing import Literal
+
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from m100bot.services.report import TodayLine
 
+CardAction = Literal["ok", "edit", "add", "cancel", "back", "item", "del", "qdel", "pick"]
+TodayAction = Literal["edit", "row", "clear", "back"]
+
 
 class Act(CallbackData, prefix="r"):
     """Действие над карточкой отчёта."""
 
-    a: str  # ok | edit | add | cancel | back | item | del | qdel | pick
+    a: CardAction
     t: str = ""  # отпечаток черновика
     i: int = -1  # номер позиции в черновике (с 0)
     r: int = 0  # строка таблицы (для pick; 0 — «нет нужного»)
@@ -24,7 +29,7 @@ class Act(CallbackData, prefix="r"):
 class Today(CallbackData, prefix="d"):
     """Действие в /today."""
 
-    a: str  # edit | row | clear | back
+    a: TodayAction
     r: int = 0  # строка таблицы
 
 

@@ -38,10 +38,6 @@ class SheetsSettings(BaseSettings):
     worksheet_name: str = "Лист1"
     synonyms_worksheet_name: str = "Синонимы"
 
-    @property
-    def spreadsheet_url(self) -> str:
-        return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/edit"
-
 
 class Settings(LlmSettings, SheetsSettings):
     # Telegram

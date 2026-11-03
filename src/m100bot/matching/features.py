@@ -60,14 +60,14 @@ def extract_features(name: str) -> Features:
 INCH_TO_MM = {"1/4": 6.35, "3/8": 9.52, "1/2": 12.7, "5/8": 15.88, "3/4": 19.05}
 # «6-ка», «девятка», «двенашка» — номинал медной трубы → точный диаметр
 _SLANG_NOMINAL = {6: 6.35, 9: 9.52, 12: 12.7}
-_SLANG_WORDS = [
+SLANG_WORDS = [
     (re.compile(r"\bшестер\w*"), 6),
     (re.compile(r"\bдевят(?:к|очк)\w*"), 9),
     (re.compile(r"\bдвена(?:шк|дцатк)\w*"), 12),
 ]
 # «6-ка», «25-й», «76-е», «80-х», «12-ю», «20-ку»
 _NUM_SUFFIX = re.compile(r"(?<![\d.])(\d{1,3})-[а-я]{1,3}\b")
-_FRACTION = re.compile(r"(?<![\d./])(1/4|3/8|1/2|5/8|3/4)(?![\d/])")
+FRACTION = re.compile(r"(?<![\d./])(1/4|3/8|1/2|5/8|3/4)(?![\d/])")
 # явная десятичная: «12.7», «9.52» — но не объём «0.5 кг», «8.5 м»
 _DECIMAL = re.compile(r"(?<![\d.х])(\d{1,2}\.\d{1,2})(?![\d.х])(?!\s*(?:м\b|кг|шт|л\b|м2|м3))")
 _MM = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*мм\b")
@@ -90,23 +90,18 @@ _PHRASE_SECTION = re.compile(r"(?<![\d.])([2-5])(?:\s*(?:х|на)\s*|\s+)(1\.5|2
 _CROSS_ONLY = re.compile(r"\bполтор")
 
 
-class PhraseFeatures(Features):
+class PhraseFeatures(BaseModel):
     """Признаки из фразы мастера. Отличия от признаков позиции:
     - dims_mm: «9 мм» без пояснения — это может быть и диаметр, и толщина стенки;
-    - sections: «?х1.5», если названо только сечение жилы («полторашка»)."""
+    - sections: «?х1.5», если названо только сечение жилы («полторашка»);
+    - currents: все токи во фразе («20а и 32а»), у позиции ток один."""
 
+    diameters: list[float] = []
     dims_mm: list[float] = []
-    currents: list[float] = []  # все токи во фразе («20а и 32а»); current_a — первый
-
-    def is_empty(self) -> bool:
-        return not (
-            self.diameters
-            or self.dims_mm
-            or self.sections
-            or self.current_a is not None
-            or self.sizes
-            or self.models
-        )
+    sections: list[str] = []
+    currents: list[float] = []
+    sizes: list[str] = []
+    models: list[str] = []
 
 
 def _uniq(values: list) -> list:
@@ -120,8 +115,8 @@ def extract_phrase_features(phrase: str) -> PhraseFeatures:
 
     # диаметры: явные «д25»/«ф9», дюймы, жаргон и десятичные
     diams = [float(x) for x in _DIAM.findall(t)]
-    diams += [INCH_TO_MM[x] for x in _FRACTION.findall(t)]
-    for rx, nominal in _SLANG_WORDS:
+    diams += [INCH_TO_MM[x] for x in FRACTION.findall(t)]
+    for rx, nominal in SLANG_WORDS:
         if rx.search(t):
             diams.append(_SLANG_NOMINAL[nominal])
     for x in _NUM_SUFFIX.findall(t):
@@ -136,7 +131,6 @@ def extract_phrase_features(phrase: str) -> PhraseFeatures:
         found = _uniq([float(x) for x in rx.findall(t)])
         if found:
             f.currents = found
-            f.current_a = found[0]
             break
 
     # сечение кабеля: слова-числа → цифры, затем «3х1.5» / «2 1.5»

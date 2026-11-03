@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from m100bot.matching.llm import LlmError
 from m100bot.matching.models import MatchedItem, MatchStatus
 from m100bot.services.report import ReportError, ReportService, backoff_seconds
 from m100bot.sheets.addressing import CellChange, Mode
@@ -98,20 +99,14 @@ class FakeBitrix:
 
 
 class FakeMatcher:
-    def __init__(self, catalog: Catalog, items: list[MatchedItem] | None = None) -> None:
-        self.catalog = catalog
+    def __init__(self, items: list[MatchedItem] | None = None) -> None:
         self.items = items or []
-        self.refreshed: list[tuple[Catalog, dict[str, int] | None]] = []
-        self.seen: list[tuple[str, Mapping[int, float] | None]] = []
-
-    def refresh(self, catalog: Catalog, synonyms: dict[str, int] | None = None) -> None:
-        self.catalog = catalog
-        self.refreshed.append((catalog, synonyms))
+        self.seen: list[tuple[str, Catalog, Mapping[str, int] | None]] = []
 
     async def match(
-        self, text: str, remaining: Mapping[int, float] | None = None
+        self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
     ) -> list[MatchedItem]:
-        self.seen.append((text, remaining))
+        self.seen.append((text, catalog, synonyms))
         return list(self.items)
 
 
@@ -169,9 +164,7 @@ def clock() -> Clock:
 def service(
     sheets: FakeSheets, storage: Storage, bitrix: FakeBitrix, catalog: Catalog, clock: Clock
 ) -> ReportService:
-    return ReportService(
-        sheets, storage, FakeMatcher(catalog), bitrix, today=lambda: D, clock=clock
-    )
+    return ReportService(sheets, storage, FakeMatcher(), bitrix, today=lambda: D, clock=clock)
 
 
 async def draft(storage: Storage, *items: MatchedItem, text: str = "исходный текст") -> None:
@@ -181,45 +174,62 @@ async def draft(storage: Storage, *items: MatchedItem, text: str = "исходн
 # ─────────────── recognize ───────────────
 
 
-async def test_recognize_saves_draft_and_passes_remaining(
+async def test_recognize_saves_draft_and_marks_remaining(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
-    sheets.done = {17: 140.0}
-    matcher = FakeMatcher(catalog, [ok(17, 15)])
+    sheets.done = {17: 140.0, 18: 160.0}
+    matcher = FakeMatcher([ok(17, 15), ok(18, 7)])
     service = ReportService(sheets, storage, matcher, today=lambda: D)
 
-    items = await service.recognize(USER, "медь 6-ка 15 м")
+    items = await service.recognize(USER, "медь 6-ка 15 м, 9-ка 7 м")
 
-    assert items == [ok(17, 15)]
+    # остаток = план − выполнено: 265 − 140 = 125 (хватает), 162 − 160 = 2 (превышение)
+    assert [(i.row, i.remaining, i.over_remaining) for i in items] == [
+        (17, 125, False),
+        (18, 2, True),
+    ]
     saved = await storage.get_draft(USER)
-    assert saved is not None and saved.source_text == "медь 6-ка 15 м" and saved.items == items
-    _, remaining = matcher.seen[0]
-    assert remaining is not None
-    assert remaining[17] == 265 - 140  # план − выполнено
-    assert remaining[18] == 162  # ничего не сделано — весь план
+    assert saved is not None and saved.source_text == "медь 6-ка 15 м, 9-ка 7 м"
+    assert saved.items == items
 
 
-async def test_recognize_refreshes_matcher_only_when_table_data_changed(
+async def test_recognize_passes_current_table_data_to_matcher(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
-    matcher = FakeMatcher(catalog, [ok(17, 15)])
-    matcher.catalog = object()  # type: ignore[assignment]  # матчер ещё не видел справочник
+    sheets.synonyms = {"хомутов": 44}
+    matcher = FakeMatcher([ok(17, 15)])
     service = ReportService(sheets, storage, matcher, today=lambda: D)
-
     await service.recognize(USER, "a")
-    await service.recognize(USER, "b")  # справочник и синонимы те же — повторно не обновляем
-    assert len(matcher.refreshed) == 1 and matcher.refreshed[0][0] is catalog
 
     sheets.catalog = type(catalog)(catalog.positions, catalog.date_columns, catalog.last_col)
-    await service.recognize(USER, "c")  # таблицу перечитали — подхватываем новое
-    assert len(matcher.refreshed) == 2
+    await service.recognize(USER, "b")  # таблицу перечитали — матчер получает новое
+
+    assert [(t, c, s) for t, c, s in matcher.seen] == [
+        ("a", catalog, {"хомутов": 44}),
+        ("b", sheets.catalog, {"хомутов": 44}),
+    ]
+    assert matcher.seen[1][1] is sheets.catalog
+
+
+async def test_recognize_has_time_budget(
+    sheets: FakeSheets, storage: Storage, catalog: Catalog
+) -> None:
+    class Slow(FakeMatcher):
+        async def match(self, text, catalog, synonyms=None):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(10)
+            return []
+
+    service = ReportService(sheets, storage, Slow(), today=lambda: D, recognize_budget_s=0.05)
+    with pytest.raises(LlmError, match="слишком много времени"):
+        await service.recognize(USER, "медь")
+    assert await storage.get_draft(USER) is None
 
 
 async def test_empty_result_keeps_previous_draft(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
     await draft(storage, ok(17, 15))
-    service = ReportService(sheets, storage, FakeMatcher(catalog, []), today=lambda: D)
+    service = ReportService(sheets, storage, FakeMatcher([]), today=lambda: D)
     assert await service.recognize(USER, "привет") == []
     saved = await storage.get_draft(USER)
     assert saved is not None and saved.items == [ok(17, 15)]
@@ -230,17 +240,18 @@ async def test_recognize_survives_unreadable_remaining_and_synonyms(
 ) -> None:
     sheets.done_error = SheetsError("Таблица недоступна.")
     sheets.synonyms_error = SheetsError("Таблица недоступна.")
-    matcher = FakeMatcher(catalog, [ok(17, 15)])
+    matcher = FakeMatcher([ok(17, 15)])
     service = ReportService(sheets, storage, matcher, today=lambda: D)
+    # без остатков просто нет предупреждения ⚠️, без синонимов — работаем без них
     assert await service.recognize(USER, "медь") == [ok(17, 15)]
-    assert matcher.seen[0][1] is None  # без остатков: просто нет предупреждения ⚠️
+    assert matcher.seen[0][2] == {}
 
 
 async def test_recognize_needs_the_catalog(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
     sheets.catalog_error = SheetsError("Таблица недоступна. Попробуйте позже.")
-    service = ReportService(sheets, storage, FakeMatcher(catalog, [ok(17, 1)]), today=lambda: D)
+    service = ReportService(sheets, storage, FakeMatcher([ok(17, 1)]), today=lambda: D)
     with pytest.raises(SheetsError, match="недоступна"):
         await service.recognize(USER, "медь")
     assert await storage.get_draft(USER) is None
@@ -500,7 +511,7 @@ async def test_outbox_snapshot_covers_the_whole_day(
 async def test_no_bitrix_configured_means_no_outbox(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
-    service = ReportService(sheets, storage, FakeMatcher(catalog), None, today=lambda: D)
+    service = ReportService(sheets, storage, FakeMatcher(), None, today=lambda: D)
     await draft(storage, ok(17, 15))
     await service.confirm(USER, D)
     assert await storage.pending_outbox() == []
@@ -662,17 +673,3 @@ async def test_correct_today_rejects_non_position_row(
     with pytest.raises(ReportError, match="не является позицией"):
         await service.correct_today(USER, 52, 5)  # строка «ИТОГО ПО ОВ 3»
     assert sheets.calls["write_volumes"] == 0
-
-
-# ─────────────── remaining ───────────────
-
-
-async def test_remaining(service: ReportService, sheets: FakeSheets) -> None:
-    sheets.done = {17: 140.0}
-    assert await service.remaining(17) == (265.0, 140.0, "м")
-    assert await service.remaining(18) == (162.0, 0.0, "м")
-
-
-async def test_remaining_of_non_position(service: ReportService) -> None:
-    with pytest.raises(ValueError, match="не является позицией"):
-        await service.remaining(4)

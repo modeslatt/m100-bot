@@ -16,12 +16,12 @@ from m100bot.matching.normalize import normalize_text, parse_number
 from m100bot.sheets.catalog import (
     COL_DONE,
     DATE_ROW,
+    EXCEL_EPOCH,
     FIRST_DATE_COL,
     SUM_LAST_COL,
     Position,
 )
 
-EXCEL_EPOCH = date(1899, 12, 30)  # нулевой день серийных дат Google Sheets / Excel
 VOLUME_LABEL = "объем"  # подпись под каждой датой (строка 4)
 Mode = Literal["add", "set"]
 

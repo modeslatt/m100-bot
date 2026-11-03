@@ -1,6 +1,6 @@
 from datetime import date
 
-from m100bot.sheets.catalog import Catalog, done_volume
+from m100bot.sheets.catalog import Catalog
 
 
 def test_positions_count(catalog: Catalog) -> None:
@@ -40,8 +40,3 @@ def test_date_columns_and_duplicates(catalog: Catalog) -> None:
     assert catalog.column_for(date(2026, 8, 22)) is None  # пропущенный день
     assert catalog.duplicate_dates() == {date(2026, 9, 30): [48, 49]}  # AV, AW
     assert catalog.last_col == 49
-
-
-def test_done_volume(sample_rows, catalog: Catalog) -> None:
-    # медь Д6,35: 15+11+15+46+53
-    assert done_volume(sample_rows, 17, catalog.last_col) == 140

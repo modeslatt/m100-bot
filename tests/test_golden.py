@@ -77,14 +77,14 @@ def matcher(catalog: Catalog):
     except OSError:
         pytest.skip(f"LLM недоступна по {base_url} — запусти Ollama (тест точности пропущен)")
 
-    return Matcher(catalog, LlmExtractor.from_settings(settings))
+    return Matcher(LlmExtractor.from_settings(settings))
 
 
 @pytest.mark.asyncio(loop_scope="module")  # один loop на модуль: HTTP-клиент matcher'а общий
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
-async def test_match(case: dict, matcher) -> None:
+async def test_match(case: dict, matcher, catalog: Catalog) -> None:
     try:
-        items = await matcher.match(case["text"])
+        items = await matcher.match(case["text"], catalog)
     except NotImplementedError:
         pytest.skip("Matcher.match ещё не реализован")
     got = Counter(_key(i) for i in items)

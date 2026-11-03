@@ -48,7 +48,7 @@ def sheets(catalog: Catalog) -> FakeSheets:
 
 @pytest.fixture
 def service(sheets: FakeSheets, storage: Storage, catalog: Catalog) -> ReportService:
-    return ReportService(sheets, storage, FakeMatcher(catalog), FakeBitrix(), today=lambda: D)
+    return ReportService(sheets, storage, FakeMatcher(), FakeBitrix(), today=lambda: D)
 
 
 async def put(storage: Storage, *items: MatchedItem, text: str = "текст"):
@@ -210,7 +210,7 @@ async def test_append_adds_to_the_end(
     service: ReportService, storage: Storage, catalog: Catalog
 ) -> None:
     await put(storage, ok(17, 15), text="первый")
-    service.matcher = FakeMatcher(catalog, [ok(44, 10)])
+    service.matcher = FakeMatcher([ok(44, 10)])
     draft, added = await service.append(USER, "второй")
     assert added == 1 and draft is not None
     assert [i.row for i in draft.items] == [17, 44] and draft.source_text == "первый\nвторой"
@@ -220,7 +220,7 @@ async def test_append_with_nothing_found_changes_nothing(
     service: ReportService, storage: Storage, catalog: Catalog
 ) -> None:
     before = await put(storage, ok(17, 15))
-    service.matcher = FakeMatcher(catalog, [])
+    service.matcher = FakeMatcher([])
     draft, added = await service.append(USER, "ничего")
     assert added == 0 and draft == before
 

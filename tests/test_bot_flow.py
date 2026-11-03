@@ -62,7 +62,7 @@ class Env:
 async def make_env(tmp_path: Path, catalog: Catalog, allowed: tuple[int, ...] = ()) -> Env:
     storage = Storage(tmp_path / "bot.sqlite3")
     await storage.init()
-    sheets, matcher, bitrix = FakeSheets(catalog), FakeMatcher(catalog), FakeBitrix()
+    sheets, matcher, bitrix = FakeSheets(catalog), FakeMatcher(), FakeBitrix()
     service = ReportService(sheets, storage, matcher, bitrix, today=lambda: D)
     dp = build_dispatcher(service, allowed)
     session = FakeSession()
@@ -99,9 +99,8 @@ async def test_text_becomes_card(env: Env) -> None:
 
 
 async def test_over_remaining_warning(env: Env) -> None:
-    over = ok(55, 56)
-    over.over_remaining, over.remaining = True, 12
-    card = await report(env, over)
+    env.sheets.done = {55: 170.0}  # по смете 182 м — осталось 12
+    card = await report(env, ok(55, 56))
     assert (
         "1. ⚠️ Кабель силовой в ПВХ изоляции и оболочке, негорючий, 3х2,5 — 56 м\n"
         "   превышает остаток (осталось 12 м)"
@@ -121,10 +120,10 @@ async def test_nothing_recognized_keeps_old_draft(env: Env) -> None:
 
 async def test_recognition_error_is_shown(env: Env) -> None:
     class Boom(FakeMatcher):
-        async def match(self, text, remaining=None):
+        async def match(self, text, catalog, synonyms=None):
             raise LlmError("Сервис распознавания сейчас недоступен. Попробуйте позже.")
 
-    env.service.matcher = Boom(env.sheets.catalog)
+    env.service.matcher = Boom()
     await env.chat.say("медь")
     assert env.chat.texts() == ["Сервис распознавания сейчас недоступен. Попробуйте позже."]
     assert await env.storage.get_draft(1) is None

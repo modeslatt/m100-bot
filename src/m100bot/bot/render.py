@@ -1,7 +1,7 @@
 """Тексты бота и разбор ввода мастера — чистые функции, без aiogram.
 
 Тексты короткие, на «вы». Эмодзи в сообщениях — только маркеры статуса: ✅ ⚠️ ❓.
-Названия позиций — полные, из таблицы (`compact_name`): короткие автоматически получаются
+Названия позиций — полные, из таблицы (`Position.short_name`): короткие автоматически получаются
 плохо («Хомут для крепления» для двух разных строк).
 """
 
@@ -11,9 +11,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal
 
-from m100bot.matching.llm import compact_name
 from m100bot.matching.models import MatchedItem, MatchStatus
-from m100bot.services.report import TodayLine, fmt_qty, is_ready
+from m100bot.services.report import TodayLine, fmt_qty
 from m100bot.sheets.catalog import Catalog, Position
 
 HELP = (
@@ -95,7 +94,7 @@ def needs_qty(item: MatchedItem) -> bool:
 
 def card_counts(items: list[MatchedItem]) -> tuple[int, int]:
     """(готовых к записи, требующих уточнения)."""
-    ready = sum(1 for i in items if is_ready(i))
+    ready = sum(1 for i in items if i.is_ready)
     unresolved = sum(1 for i in items if needs_choice(i) or needs_qty(i))
     return ready, unresolved
 
@@ -106,7 +105,7 @@ def _pos(item: MatchedItem, catalog: Catalog) -> Position | None:
 
 def _name(item: MatchedItem, catalog: Catalog) -> str:
     pos = _pos(item, catalog)
-    return compact_name(pos.name) if pos else f"строка {item.row}"
+    return pos.short_name if pos else f"строка {item.row}"
 
 
 # ─────────────── Карточка ───────────────
@@ -115,7 +114,7 @@ def _name(item: MatchedItem, catalog: Catalog) -> str:
 def item_line(n: int, item: MatchedItem, catalog: Catalog) -> str:
     pos = _pos(item, catalog)
     unit = pos.unit if pos else (item.unit or "")
-    if is_ready(item):
+    if item.is_ready:
         assert item.qty is not None
         marker = "⚠️" if item.over_remaining else "✅"
         line = f"{n}. {marker} {_name(item, catalog)} — {fmt_qty(item.qty)} {unit}".rstrip()
@@ -171,10 +170,10 @@ class Question:
 def choice_options(item: MatchedItem, catalog: Catalog) -> list[tuple[int, str]]:
     """Подписи кнопок. Одинаковые названия (строки 48/49) различаем № и количеством по смете."""
     positions = [p for r in item.candidates if (p := catalog.by_row(r)) is not None]
-    names = Counter(compact_name(p.name) for p in positions)
+    names = Counter(p.short_name for p in positions)
     options = []
     for p in sorted(positions, key=lambda p: p.row):
-        name = compact_name(p.name)
+        name = p.short_name
         if names[name] > 1:
             num = p.number if p.number is not None else p.row
             suffix = f" · № {num}, по смете {fmt_qty(p.planned)} {p.unit}"

@@ -14,12 +14,12 @@ from m100bot.matching.llm import (
     LlmError,
     LlmExtractor,
     LlmProvider,
-    compact_name,
     format_catalog,
     parse_response,
     strict_json_schema,
 )
 from m100bot.matching.models import LlmResponse
+from m100bot.matching.normalize import compact_name
 from m100bot.sheets.catalog import Catalog
 
 GOOD = (

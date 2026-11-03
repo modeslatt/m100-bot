@@ -39,7 +39,21 @@ class MatchedItem(BaseModel):
     status: MatchStatus
     row: int | None = None  # выбранная строка, если status == OK
     candidates: list[int] = []  # варианты для кнопок при AMBIGUOUS
-    message: str | None = None  # что сказать мастеру (почему уточняем)
     over_remaining: bool = False  # объём больше остатка по смете
     remaining: float | None = None  # сколько осталось по смете (для «осталось 12 м»)
     picked: bool = False  # вариант выбрал мастер кнопкой — после записи запомним как синоним
+
+    @property
+    def is_ready(self) -> bool:
+        """Можно записывать: позиция определена, объём назван."""
+        return (
+            self.status == MatchStatus.OK
+            and self.row is not None
+            and self.qty is not None
+            and self.qty > 0
+        )
+
+    def with_remaining(self, left: float | None) -> "MatchedItem":
+        """Отметить остаток по смете и превышение его объёмом (⚠️ в карточке)."""
+        over = self.qty is not None and left is not None and self.qty > left + 1e-9
+        return self.model_copy(update={"remaining": left, "over_remaining": over})

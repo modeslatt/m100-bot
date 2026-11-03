@@ -104,7 +104,8 @@ def test_phrase_sections(phrase: str, sections: list[str]) -> None:
     ],
 )
 def test_phrase_current(phrase: str, current: float | None) -> None:
-    assert extract_phrase_features(phrase).current_a == current
+    expected = [current] if current is not None else []
+    assert extract_phrase_features(phrase).currents == expected
 
 
 def test_phrase_sizes_and_models() -> None:

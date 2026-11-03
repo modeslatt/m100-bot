@@ -8,10 +8,11 @@
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import cached_property
 from typing import Any
 
 from m100bot.matching.features import Features, extract_features
-from m100bot.matching.normalize import normalize_text, normalize_unit, parse_number
+from m100bot.matching.normalize import compact_name, normalize_text, normalize_unit, parse_number
 
 # Раскладка листа (см. CLAUDE.md → «Структура таблицы»)
 COL_NUM, COL_NAME, COL_UNIT, COL_QTY, COL_PRICE = 1, 2, 3, 4, 5
@@ -23,7 +24,7 @@ FIRST_DATA_ROW = 5
 SUM_LAST_COL = 104  # CZ — правая граница формулы SUM(J:CZ)
 
 _SECTION = re.compile(r"^(ов|эм)\s*\d+$")
-_EXCEL_EPOCH = date(1899, 12, 30)
+EXCEL_EPOCH = date(1899, 12, 30)  # нулевой день серийных дат Google Sheets / Excel
 
 
 @dataclass(frozen=True)
@@ -38,9 +39,15 @@ class Position:
     group: str | None
     features: Features = field(compare=False, hash=False)
 
-    @property
+    # Считаются один раз на позицию: матчер и тексты бота обращаются к ним постоянно
+    @cached_property
     def norm_name(self) -> str:
         return normalize_text(self.name)
+
+    @cached_property
+    def short_name(self) -> str:
+        """Название без шаблонного текста — для промпта LLM и текстов бота."""
+        return compact_name(self.name)
 
 
 @dataclass
@@ -72,7 +79,7 @@ def _to_date(value: Any) -> date | None:
     if isinstance(value, date):
         return value
     if isinstance(value, int | float):  # серийный номер даты Google/Excel
-        return _EXCEL_EPOCH + timedelta(days=int(value))
+        return EXCEL_EPOCH + timedelta(days=int(value))
     s = str(value).strip()
     for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
@@ -139,9 +146,3 @@ def parse_catalog(rows: list[list[Any]]) -> Catalog:
 
     date_columns, last_col = parse_date_columns(rows)
     return Catalog(positions=positions, date_columns=date_columns, last_col=last_col)
-
-
-def done_volume(rows: list[list[Any]], row: int, last_col: int) -> float:
-    """Выполненный объём, посчитанный по ячейкам дат (не доверяем формуле в I)."""
-    r = rows[row - 1]
-    return sum(parse_number(_cell(r, c)) or 0.0 for c in range(FIRST_DATE_COL, last_col + 1))

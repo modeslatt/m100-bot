@@ -44,7 +44,7 @@ def make_service(fake: FakeGspread, storage: Storage, catalog: Catalog):
         client = SheetsClient(
             Path("x.json"), fake.spreadsheet_id, "Лист1", retry_wait_s=0, gspread_client=fake
         )
-        return ReportService(client, storage, FakeMatcher(catalog), bitrix, today=lambda: today)
+        return ReportService(client, storage, FakeMatcher(), bitrix, today=lambda: today)
 
     return build
 
@@ -84,7 +84,7 @@ async def test_new_day_creates_column_and_journals_zero(
 async def test_full_flow_through_outbox(make_service, storage: Storage, catalog: Catalog) -> None:
     bitrix = FakeBitrix()
     service = make_service(NEW, bitrix)
-    service.matcher = FakeMatcher(catalog, [ok(17, 15), ok(55, 56)])
+    service.matcher = FakeMatcher([ok(17, 15), ok(55, 56)])
 
     await service.recognize(USER, "медь 6-ка 15 м, кабель 3х2,5 — 56 м")
     await service.confirm(USER, NEW, master="Иван Петров")
@@ -101,14 +101,12 @@ async def test_recognize_computes_remaining_from_real_sheet(
     make_service, storage: Storage, catalog: Catalog
 ) -> None:
     service = make_service(NEW)
-    matcher = FakeMatcher(catalog, [ok(17, 15)])
+    matcher = FakeMatcher([ok(17, 15)])
     service.matcher = matcher
 
-    await service.recognize(USER, "медь")
+    [item] = await service.recognize(USER, "медь")
 
-    remaining = matcher.seen[0][1]
-    assert remaining is not None and remaining[17] == 265 - 140  # выполнено 140 по формуле I17
-    assert await service.remaining(17) == (265.0, 140.0, "м")
+    assert item.remaining == 265 - 140  # выполнено 140 по формуле I17
 
 
 async def test_correction_after_confirm_sets_value(

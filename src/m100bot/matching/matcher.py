@@ -1,22 +1,31 @@
-"""Гибридное сопоставление: синонимы → LLM → валидатор признаков и единиц.
+"""Гибридное сопоставление: синонимы → LLM → проверка и уточнение кодом.
 
-Публичный интерфейс — `Matcher.match(text) -> list[MatchedItem]`. Его вызывает и бот,
-и эталонный тест tests/test_golden.py.
+Публичный интерфейс — `Matcher.match(text, catalog, synonyms) -> list[MatchedItem]`.
+Его вызывают сервис отчётов и эталонный тест tests/test_golden.py. Справочник и синонимы
+передаются в каждый вызов: таблицу правят, и матчер не должен хранить устаревшую копию.
 
-LLM только предлагает кандидатов. Валидатор их не добавляет, а только отсеивает:
-если после проверки признаков не осталось ни одного — NOT_FOUND, сами ничего не подставляем.
+LLM предлагает кандидатов, код их проверяет и уточняет:
+- отсеивает кандидатов, у которых признаки (диаметр, сечение, ток, размер, модель) не
+  совпадают с фразой;
+- добавляет другие варианты того же товара (`expand_siblings`): LLM часто находит товар,
+  но ошибается в варианте («кабель 3х2,5» вместо названной «полторашки»);
+- если материал не назван («девятку протянули»), добавляет все позиции с этим размером;
+- из оставшихся предпочитает позиции, где признак или слово фразы есть явно.
+Товар другого типа (другое первое слово названия) код сам не подставляет никогда.
+Остался один кандидат → OK, несколько → спросить мастера, ноль → «нет в смете».
 """
 
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping
-from typing import Any, Protocol
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Protocol
 
 from loguru import logger
 
 from m100bot.matching.features import PhraseFeatures, extract_phrase_features
-from m100bot.matching.llm import compact_name
 from m100bot.matching.models import LlmMention, LlmResponse, MatchedItem, MatchStatus
 from m100bot.matching.normalize import normalize_text, normalize_unit
 from m100bot.matching.phrase import (
@@ -28,8 +37,27 @@ from m100bot.matching.phrase import (
 )
 from m100bot.sheets.catalog import Catalog, Position
 
-_TRAILING_QTY = re.compile(r"[\s—–-]*\d+(?:\.\d+)?\s*[а-я.]*\s*$")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+# Сколько первых букв слова сравниваем. Разные задачи — разная строгость:
+TYPE_PREFIX = 3  # «называет ли фраза тип позиции»: «хом» — хомут, хомуты, хомутов
+WORD_PREFIX = 4  # «есть ли слово фразы в названии»: строже, чтобы не путать похожие слова
+GROUP_PREFIX = 5  # «варианты одного товара»: «кабел», «хомут» — по первому слову названия
+
+# Жаргон мастера, который называет тип позиции другим словом (как «шестёрка» в features.py)
+TYPE_SLANG = {"трасс": "фре"}  # «трасса» — фреоновая трасса, т.е. фреонопровод
+
+
+class Extractor(Protocol):
+    async def extract(self, text: str, catalog: Catalog) -> LlmResponse: ...
+
+
+# ─────────────── Числа и слова названия ───────────────
+
+
+@lru_cache(maxsize=4096)
+def _name_words(short_name: str) -> tuple[str, ...]:
+    return tuple(words(short_name))
 
 
 def _name_numbers(pos: Position) -> set[float]:
@@ -40,10 +68,6 @@ def _numbers_in_name(spec: str, pos: Position) -> bool:
     """Все числа из «25х16» / «3х1.5» встречаются в названии позиции."""
     numbers = _name_numbers(pos)
     return all(float(x) in numbers for x in spec.split("х"))
-
-
-class Extractor(Protocol):
-    async def extract(self, text: str, catalog: Catalog) -> LlmResponse: ...
 
 
 # ─────────────── Сравнение признаков ───────────────
@@ -68,157 +92,139 @@ def _section_ok(phrase_section: str, item_section: str) -> bool:
     return cores == "?" or cores == item_cores
 
 
-def features_conflict(pf: PhraseFeatures, pos: Position) -> str | None:
-    """Почему позиция не подходит к признакам фразы; None — подходит.
+# Проверка одного вида признака: True — у позиции признак есть и совпал, False — есть и
+# не совпал (конфликт), None — у позиции такого признака нет, проверка неприменима
+# (диаметр «20» не мешает автомату, ток «16» не мешает трубе).
+Check = Callable[[Position], bool | None]
 
-    Признак фразы ограничивает только те позиции, у которых признак того же вида есть
-    (диаметр «20» не мешает автомату, ток «16» не мешает трубе). Если во фразе названо
-    несколько значений одного вида, достаточно совпадения с любым из них.
+
+def _any_or_none(values: list, test: Callable[[object], bool]) -> bool | None:
+    return any(test(v) for v in values) if values else None
+
+
+def feature_checks(pf: PhraseFeatures) -> list[tuple[str, Check]]:
+    """Проверки по видам признаков, названным во фразе. Порядок важен для `prefer_explicit`.
+
+    Если во фразе названо несколько значений одного вида, достаточно совпадения с любым.
     """
-    f = pos.features
-    if (
-        pf.diameters
-        and f.diameters
-        and not any(_same_size(p, d) for p in pf.diameters for d in f.diameters)
-    ):
-        return f"диаметр {pf.diameters} ≠ {f.diameters}"
-    # «9 мм» — это может быть и диаметр, и толщина стенки изоляции
-    dims = f.diameters + f.thickness
-    if pf.dims_mm and dims and not any(_same_size(p, d) for p in pf.dims_mm for d in dims):
-        return f"размер {pf.dims_mm} мм ≠ {dims}"
-    if (
-        pf.sections
-        and f.sections
-        and not any(_section_ok(p, s) for p in pf.sections for s in f.sections)
-    ):
-        return f"сечение {pf.sections} ≠ {f.sections}"
-    if pf.currents and f.current_a is not None and f.current_a not in pf.currents:
-        return f"ток {pf.currents} ≠ {f.current_a}"
-    if pf.sizes and f.sizes and not set(pf.sizes) & set(f.sizes):
-        return f"размер {pf.sizes} ≠ {f.sizes}"
-    # Размер «25х16» и полное сечение «3х1.5» — это два числа сразу. Если у позиции такого
-    # признака нет, она подходит, только если оба числа есть в её названии: «отвод 90° Д25»
-    # для «90 на 25» — да, «труба Д25» для «короб 25х16» — нет.
-    if pf.sizes and not f.sizes and not any(_numbers_in_name(s, pos) for s in pf.sizes):
-        return f"размер {pf.sizes} не встречается в названии"
-    full_sections = [s for s in pf.sections if not s.startswith("?")]
-    if (
-        full_sections
-        and not f.sections
-        and not any(_numbers_in_name(s, pos) for s in full_sections)
-    ):
-        return f"сечение {full_sections} не встречается в названии"
-    if pf.models and f.models and not any(m.startswith(p) for p in pf.models for m in f.models):
-        return f"модель {pf.models} ≠ {f.models}"
-    return None
-
-
-# ─────────────── Явные совпадения и слова фразы ───────────────
-
-
-def _positive_tests(pf: PhraseFeatures, numbers: list[float]) -> list[tuple[str, Any]]:
-    """Проверки «позиция явно подтверждает признак фразы» — по видам признаков."""
-    tests: list[tuple[str, Any]] = []
+    checks: list[tuple[str, Check]] = []
     if pf.diameters:
-        tests.append(
+        checks.append(
             (
                 "диаметр",
-                lambda p: any(_same_size(x, d) for x in pf.diameters for d in p.features.diameters),
+                lambda p: _any_or_none(
+                    p.features.diameters, lambda d: any(_same_size(x, d) for x in pf.diameters)
+                ),
             )
         )
     if pf.dims_mm:
-        tests.append(
+        # «9 мм» — это может быть и диаметр, и толщина стенки изоляции
+        checks.append(
             (
                 "мм",
-                lambda p: any(
-                    _same_size(x, d)
-                    for x in pf.dims_mm
-                    for d in p.features.diameters + p.features.thickness
+                lambda p: _any_or_none(
+                    p.features.diameters + p.features.thickness,
+                    lambda d: any(_same_size(x, d) for x in pf.dims_mm),
                 ),
             )
         )
     if pf.sections:
-        tests.append(
-            (
-                "сечение",
-                lambda p: any(
-                    _section_ok(s, ps) for s in pf.sections for ps in p.features.sections
-                ),
-            )
-        )
+        full = [s for s in pf.sections if not s.startswith("?")]
+
+        def section(p: Position) -> bool | None:
+            if p.features.sections:
+                return any(_section_ok(s, ps) for s in pf.sections for ps in p.features.sections)
+            # Полное сечение «3х1.5» — это два числа. У позиции без сечения оба должны быть
+            # в названии: «отвод 90° Д25» для «90 на 25» — да, «труба Д25» для «3х1.5» — нет.
+            return any(_numbers_in_name(s, p) for s in full) if full else None
+
+        checks.append(("сечение", section))
     if pf.sizes:
-        tests.append(
+        # Размер «25х16» — тоже два числа: без признака размера — ищем оба в названии
+        checks.append(
             (
                 "размер",
                 lambda p: (
                     bool(set(pf.sizes) & set(p.features.sizes))
-                    or any(_numbers_in_name(s, p) for s in pf.sizes)
+                    if p.features.sizes
+                    else any(_numbers_in_name(s, p) for s in pf.sizes)
                 ),
             )
         )
     if pf.currents:
-        tests.append(("ток", lambda p: p.features.current_a in pf.currents))
+        checks.append(
+            (
+                "ток",
+                lambda p: (
+                    None if p.features.current_a is None else p.features.current_a in pf.currents
+                ),
+            )
+        )
     if pf.models:
-        tests.append(
+        checks.append(
             (
                 "модель",
-                lambda p: any(m.startswith(x) for x in pf.models for m in p.features.models),
+                lambda p: _any_or_none(
+                    p.features.models, lambda m: any(m.startswith(x) for x in pf.models)
+                ),
             )
         )
-    if numbers:
-        tests.append(
-            (
-                "числа",
-                lambda p: all(any(_same_size(n, x) for x in _name_numbers(p)) for n in numbers),
-            )
-        )
-    return tests
+    return checks
 
 
-def prefer_positive(
-    pf: PhraseFeatures, numbers: list[float], survivors: list[Position]
+def features_conflict(checks: list[tuple[str, Check]], pos: Position) -> str | None:
+    """Какой признак фразы противоречит позиции; None — противоречий нет."""
+    for kind, check in checks:
+        if check(pos) is False:
+            return kind
+    return None
+
+
+def prefer_explicit(
+    checks: list[tuple[str, Check]], numbers: list[float], survivors: list[Position]
 ) -> list[Position]:
     """Если признак фразы явно есть у части позиций — оставляем только их.
 
     «гофра 20-ка»: у трубы ПВХ Д20 диаметр 20 есть, у кабелей диаметра нет вовсе —
     кабели уходят. Если явного совпадения нет ни у кого, признак ничего не меняет.
+    Голые числа фразы («насос 1») — тоже признак: все они должны быть в названии.
     """
-    for _kind, test in _positive_tests(pf, numbers):
-        hit = [p for p in survivors if test(p)]
+    tests: list[Callable[[Position], bool | None]] = [check for _, check in checks]
+    if numbers:
+        tests.append(
+            lambda p: all(any(_same_size(n, x) for x in _name_numbers(p)) for n in numbers)
+        )
+    for test in tests:
+        hit = [p for p in survivors if test(p) is True]
         if hit:
             survivors = hit
     return survivors
 
 
-# Жаргон мастера, который называет тип позиции другим словом (как «шестёрка» в features.py)
-TYPE_SLANG = {"трасс": "фре"}  # «трасса» — фреоновая трасса, т.е. фреонопровод
+# ─────────────── Слова фразы ───────────────
 
 
-def _type_words(pos: Position) -> list[str]:
-    """Первые три значимых слова короткого названия — «что это за позиция»."""
-    return [w for w in words(compact_name(pos.name)) if len(w) >= 4][:3]
-
-
-def _prefix3(word: str) -> str:
+def _type_prefix(word: str) -> str:
     for slang, prefix in TYPE_SLANG.items():
         if word.startswith(slang):
             return prefix
-    return word[:3]
+    return word[:TYPE_PREFIX]
 
 
 def names_type(text_words: list[str], pos: Position) -> int:
-    """Сколько слов текста называют тип позиции (совпадение первых 3 букв)."""
-    tw = {w[:3] for w in _type_words(pos)}
-    return sum(1 for w in text_words if len(w) >= 4 and _prefix3(w) in tw)
+    """Сколько слов текста называют тип позиции (первые три значимых слова названия)."""
+    type_words = [w for w in _name_words(pos.short_name) if len(w) >= 4][:3]
+    prefixes = {w[:TYPE_PREFIX] for w in type_words}
+    return sum(1 for w in text_words if len(w) >= 4 and _type_prefix(w) in prefixes)
 
 
 def _word_hits(text_words: list[str], pos: Position) -> int:
-    """Сколько слов фразы встречается в полном названии (4 буквы или короткое слово целиком)."""
-    name = words(compact_name(pos.name))
+    """Сколько слов фразы встречается в названии (по началу слова; короткое — целиком)."""
+    name = _name_words(pos.short_name)
     hits = 0
     for w in text_words:
-        if len(w) >= 4:
-            hits += any(nw.startswith(w[:4]) for nw in name)
+        if len(w) >= WORD_PREFIX:
+            hits += any(nw.startswith(w[:WORD_PREFIX]) for nw in name)
         elif len(w) >= 2:
             hits += w in name
     return hits
@@ -240,6 +246,29 @@ def prefer_by_words(text_words: list[str], survivors: list[Position]) -> list[Po
     return survivors
 
 
+def _group_key(pos: Position) -> tuple[str, str] | None:
+    """«Варианты одного товара»: одинаковое первое слово названия и ед. изм."""
+    head = next((w for w in _name_words(pos.short_name) if len(w) >= 4), None)
+    return (head[:GROUP_PREFIX], pos.unit) if head else None
+
+
+# ─────────────── Итог по позиции ───────────────
+
+
+def resolve_position(item: MatchedItem, pos: Position) -> MatchedItem:
+    """Позиция определена (матчером или кнопкой мастера) — проверяем ед. изм. и объём.
+
+    Ед. изм. не та → CLARIFY («в смете шт, а сказано м»); объём не назван → CLARIFY;
+    иначе OK. Одно правило для матчера и для выбора кнопкой.
+    """
+    unit = normalize_unit(item.unit)
+    if (unit is not None and unit != pos.unit) or item.qty is None or item.qty <= 0:
+        status = MatchStatus.CLARIFY
+    else:
+        status = MatchStatus.OK
+    return item.model_copy(update={"row": pos.row, "candidates": [], "status": status})
+
+
 # ─────────────── Ссылки «изоляцию на них столько же» ───────────────
 
 _REFERENCE = re.compile(
@@ -250,69 +279,52 @@ _REFERENCE = re.compile(
 # ─────────────── Matcher ───────────────
 
 
+@dataclass(frozen=True)
+class _Index:
+    """Справочник и синонимы одного вызова, подготовленные для поиска."""
+
+    catalog: Catalog
+    synonyms: dict[str, int]  # ключ синонима (`synonym_key`) → строка
+    groups: dict[tuple[str, str], list[Position]]
+
+    @classmethod
+    def build(cls, catalog: Catalog, synonyms: Mapping[str, int] | None) -> "_Index":
+        keys = {synonym_key(k): v for k, v in (synonyms or {}).items()}
+        groups: dict[tuple[str, str], list[Position]] = {}
+        for p in catalog.positions:
+            if key := _group_key(p):
+                groups.setdefault(key, []).append(p)
+        return cls(catalog, {k: v for k, v in keys.items() if k}, groups)
+
+    def synonym(self, phrase: str, qty: float | None) -> Position | None:
+        """Фраза мастера совпала с листом «Синонимы» (без объёма и глаголов)."""
+        row = self.synonyms.get(synonym_key(phrase, qty))
+        return self.catalog.by_row(row) if row is not None else None
+
+
 class Matcher:
-    def __init__(
-        self,
-        catalog: Catalog,
-        llm: Extractor,
-        synonyms: dict[str, int] | None = None,
-        *,
-        expand_siblings: bool = True,
-    ) -> None:
+    def __init__(self, llm: Extractor, *, expand_siblings: bool = True) -> None:
         self.llm = llm
         self.expand_siblings = expand_siblings
-        self.refresh(catalog, synonyms)
-
-    def refresh(self, catalog: Catalog, synonyms: dict[str, int] | None = None) -> None:
-        """Подставить свежий справочник и синонимы (после перечитывания таблицы).
-
-        Бот живёт долго, а таблицу правят: без этого новые позиции появились бы
-        только после перезапуска.
-        """
-        self.catalog = catalog
-        # нормализованная фраза (без объёма) → строка
-        self.synonyms = {normalize_text(k): v for k, v in (synonyms or {}).items()}
-        # «варианты одного товара»: позиции с одинаковым первым словом и ед. изм.
-        # (все кабели, все хомуты, все внутренние блоки). LLM часто находит товар,
-        # но ошибается в варианте — нужный вариант код выбирает по признакам.
-        self._groups: dict[tuple[str, str], list[Position]] = {}
-        for p in catalog.positions:
-            if key := self._group_key(p):
-                self._groups.setdefault(key, []).append(p)
-
-    @staticmethod
-    def _group_key(pos: Position) -> tuple[str, str] | None:
-        head = next((w for w in words(compact_name(pos.name)) if len(w) >= 4), None)
-        return (head[:5], pos.unit) if head else None
 
     # ── сообщение целиком ──
 
     async def match(
-        self, text: str, remaining: Mapping[int, float] | None = None
+        self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
     ) -> list[MatchedItem]:
-        """Сообщение мастера → позиции на подтверждение.
-
-        remaining — остаток по смете (D − I) по номеру строки; если передан, отмечаем
-        объёмы больше остатка (⚠️ в карточке). Ошибки LLM (LlmError) пробрасываются наверх.
-        """
+        """Сообщение мастера → позиции на подтверждение. Ошибки LLM (LlmError) — наверх."""
         if not normalize_text(text):
             return []
-        mentions = await self._extract_complete(text)
+        index = _Index.build(catalog, synonyms)
+        mentions = await self._extract_complete(text, catalog)
         message_words = words(text)
 
-        items: list[MatchedItem] = []
-        for mention in mentions:
-            for part in self._split(mention):
-                row = self._synonym_row(part.phrase, part.qty)
-                items.append(self.validate(part, synonym_row=row, message_words=message_words))
-        items = self._resolve_references(items)
-
-        if remaining is not None:
-            for item in items:
-                if item.row is not None and item.qty is not None:
-                    left = remaining.get(item.row)
-                    item.over_remaining = left is not None and item.qty > left + 1e-9
-                    item.remaining = left
+        items = [
+            self._validate(part, index, message_words)
+            for mention in mentions
+            for part in _split(mention)
+        ]
+        items = self._resolve_references(items, catalog)
         logger.info(
             "match: {} позиций: {}",
             len(items),
@@ -320,12 +332,12 @@ class Matcher:
         )
         return items
 
-    async def _extract_complete(self, text: str) -> list[LlmMention]:
+    async def _extract_complete(self, text: str, catalog: Catalog) -> list[LlmMention]:
         """Вызов LLM + проверка, что ни один «объём с единицей» из сообщения не потерян.
 
         Если потерян — один раз переспрашиваем с подсказкой и берём более полный ответ.
         """
-        response = await self.llm.extract(text, self.catalog)
+        response = await self.llm.extract(text, catalog)
         missing = _missing_quantities(text, response.mentions)
         if not missing:
             return response.mentions
@@ -335,151 +347,70 @@ class Matcher:
             f"{text}\n\n(Проверка: в прошлом ответе пропущены упоминания с объёмами {hint}. "
             "Верни ВСЕ упоминания сообщения заново, каждое отдельно.)"
         )
-        retry = await self.llm.extract(retry_text, self.catalog)
+        retry = await self.llm.extract(retry_text, catalog)
         if len(_missing_quantities(text, retry.mentions)) < len(missing):
             return retry.mentions
         return response.mentions
 
-    def _split(self, mention: LlmMention) -> list[LlmMention]:
-        """Слитое упоминание («20а и 32а по одному») → по одному на значение признака.
-        Плюс объём и единица из текста, если LLM их перепутала («2 системы» → 1 шт)."""
-        parts = split_by_features(mention.phrase)
-        if parts is None:
-            return [self._qty_from_text(mention)]
-        logger.debug("«{}» разделено на {} части", mention.phrase, len(parts))
-        out = []
-        for part in parts:
-            qty = part.qty if part.qty is not None else mention.qty
-            sub = mention.model_copy(update={"phrase": part.phrase, "qty": qty})
-            out.append(self._qty_from_text(sub))
-        return out
-
-    @staticmethod
-    def _qty_from_text(mention: LlmMention) -> LlmMention:
-        found = find_quantities(mention.phrase)
-        if len(found) != 1:
-            return mention
-        q = found[0]
-        if mention.qty != q.value or normalize_unit(mention.unit) != q.unit:
-            logger.debug(
-                "«{}»: объём из текста {} {} вместо {} {}",
-                mention.phrase,
-                q.value,
-                q.unit,
-                mention.qty,
-                mention.unit,
-            )
-        return mention.model_copy(update={"qty": q.value, "unit": q.unit})
-
-    def _resolve_references(self, items: list[MatchedItem]) -> list[MatchedItem]:
+    def _resolve_references(self, items: list[MatchedItem], catalog: Catalog) -> list[MatchedItem]:
         """«изоляцию на них столько же» → по позиции на каждый диаметр из предыдущих строк."""
         out: list[MatchedItem] = []
         for item in items:
             if item.status == MatchStatus.AMBIGUOUS and _REFERENCE.search(
                 normalize_text(item.phrase)
             ):
-                resolved = self._by_previous_diameters(item, out)
+                resolved = _by_previous_diameters(item, out, catalog)
                 if resolved:
                     out.extend(resolved)
                     continue
             out.append(item)
         return out
 
-    def _by_previous_diameters(
-        self, item: MatchedItem, previous: list[MatchedItem]
-    ) -> list[MatchedItem]:
-        diameters: list[float] = []
-        for prev in previous:
-            pos = self.catalog.by_row(prev.row) if prev.row is not None else None
-            if pos and len(pos.features.diameters) == 1:
-                d = pos.features.diameters[0]
-                if d not in diameters:
-                    diameters.append(d)
-        picks: list[int] = []
-        for d in diameters:
-            rows = [
-                r
-                for r in item.candidates
-                if (p := self.catalog.by_row(r))
-                and any(_same_size(d, x) for x in p.features.diameters)
-            ]
-            if len(rows) != 1:
-                return []
-            picks.append(rows[0])
-        if not picks:
-            return []
-        status = MatchStatus.OK if item.qty else MatchStatus.CLARIFY
-        return [
-            item.model_copy(update={"status": status, "row": r, "candidates": [], "message": None})
-            for r in picks
-        ]
-
-    def _synonym_row(self, phrase: str, qty: float | None = None) -> int | None:
-        """Точное совпадение фразы (с объёмом и без него) с листом «Синонимы»."""
-        if not self.synonyms:
-            return None
-        key = normalize_text(phrase)
-        for k in (key, _TRAILING_QTY.sub("", key), synonym_key(phrase, qty)):
-            if k and k in self.synonyms:
-                return self.synonyms[k]
-        return None
-
     # ── одно упоминание ──
 
     def validate(
         self,
         mention: LlmMention,
-        synonym_row: int | None = None,
-        message_words: list[str] | None = None,
+        catalog: Catalog,
+        synonyms: Mapping[str, int] | None = None,
     ) -> MatchedItem:
-        """Проверить кандидатов LLM по признакам фразы и ед. изм.
+        """Одно упоминание → итог (используется в тестах; бот идёт через `match`)."""
+        return self._validate(mention, _Index.build(catalog, synonyms), words(mention.phrase))
 
-        0 кандидатов → NOT_FOUND; ед. изм. не та → CLARIFY; >1 → AMBIGUOUS;
-        1, но объём не назван → CLARIFY; иначе OK.
-        """
+    def _validate(
+        self, mention: LlmMention, index: _Index, message_words: list[str]
+    ) -> MatchedItem:
+        """0 кандидатов → NOT_FOUND; ед. изм. не та → CLARIFY; >1 → AMBIGUOUS;
+        1 → `resolve_position` (OK или CLARIFY, если объём не назван)."""
         unit = normalize_unit(mention.unit)
-
-        def item(status: MatchStatus, **kw: object) -> MatchedItem:
-            return MatchedItem(
-                phrase=mention.phrase, qty=mention.qty, unit=unit, status=status, **kw
-            )
-
-        synonym = self.catalog.by_row(synonym_row) if synonym_row is not None else None
+        item = MatchedItem(
+            phrase=mention.phrase, qty=mention.qty, unit=unit, status=MatchStatus.NOT_FOUND
+        )
         # синониму мастера доверяем без проверки признаков
-        if synonym:
-            survivors = [synonym]
-        else:
-            survivors = self._select(mention, message_words or words(mention.phrase))
-
+        synonym = index.synonym(mention.phrase, mention.qty)
+        survivors = [synonym] if synonym else self._select(mention, index, message_words)
         if not survivors:
-            return item(MatchStatus.NOT_FOUND, message="❓ Не нашёл такой позиции в смете.")
+            return item
 
         if unit is not None:
             same_unit = [p for p in survivors if p.unit == unit]
-            if not same_unit:
-                units = ", ".join(sorted({p.unit for p in survivors}))
-                msg = (
-                    f"❓ В смете эта позиция в «{units}», а указано «{unit}». Сколько в «{units}»?"
-                )
-                if len(survivors) == 1:
-                    return item(MatchStatus.CLARIFY, row=survivors[0].row, message=msg)
+            if not same_unit and len(survivors) > 1:
                 rows = [p.row for p in survivors]
-                return item(MatchStatus.CLARIFY, candidates=rows, message=msg)
-            survivors = same_unit
+                return item.model_copy(update={"status": MatchStatus.CLARIFY, "candidates": rows})
+            survivors = same_unit or survivors
 
         if len(survivors) > 1:
-            return item(
-                MatchStatus.AMBIGUOUS,
-                candidates=[p.row for p in survivors],
-                message="❓ Подходит несколько позиций — выберите нужную.",
+            return item.model_copy(
+                update={
+                    "status": MatchStatus.AMBIGUOUS,
+                    "candidates": [p.row for p in survivors],
+                }
             )
+        return resolve_position(item, survivors[0])
 
-        pos = survivors[0]
-        if mention.qty is None or mention.qty <= 0:
-            return item(MatchStatus.CLARIFY, row=pos.row, message=f"❓ Сколько ({pos.unit})?")
-        return item(MatchStatus.OK, row=pos.row)
-
-    def _select(self, mention: LlmMention, message_words: list[str]) -> list[Position]:
+    def _select(
+        self, mention: LlmMention, index: _Index, message_words: list[str]
+    ) -> list[Position]:
         """Кандидаты LLM → проверенные позиции.
 
         1. Кандидаты LLM + другие варианты того же товара (если expand_siblings).
@@ -489,13 +420,14 @@ class Matcher:
         5. Предпочтение позиций, которые фраза называет словами.
         """
         pf = extract_phrase_features(mention.phrase)
+        checks = feature_checks(pf)
         exclude = {mention.qty} if mention.qty is not None else set()
         numbers = bare_numbers(mention.phrase, exclude)
         phrase_words = words(mention.phrase)
 
         llm_rows: list[Position] = []
         for row in dict.fromkeys(mention.candidates):
-            pos = self.catalog.by_row(row)
+            pos = index.catalog.by_row(row)
             if pos is None:
                 logger.warning("LLM вернула строку {}, которой нет в справочнике", row)
                 continue
@@ -504,17 +436,17 @@ class Matcher:
         pool = list(llm_rows)
         if self.expand_siblings:
             for pos in llm_rows:
-                key = self._group_key(pos)
-                pool += self._groups.get(key, []) if key else []
+                key = _group_key(pos)
+                pool += index.groups.get(key, []) if key else []
         pool = list({p.row: p for p in pool}.values())
 
         survivors = []
         for pos in pool:
-            if reason := features_conflict(pf, pos):
-                logger.debug("«{}»: строка {} отсеяна: {}", mention.phrase, pos.row, reason)
+            if conflict := features_conflict(checks, pos):
+                logger.debug("«{}»: строка {} отсеяна: {}", mention.phrase, pos.row, conflict)
                 continue
             survivors.append(pos)
-        survivors = prefer_positive(pf, numbers, survivors)
+        survivors = prefer_explicit(checks, numbers, survivors)
 
         if (
             pf.diameters
@@ -523,33 +455,105 @@ class Matcher:
                 names_type(phrase_words, p) or names_type(message_words, p) for p in survivors
             )
         ):
-            survivors = self._same_size_positions(pf, survivors, normalize_unit(mention.unit))
-            survivors = prefer_positive(pf, numbers, survivors)
+            unit = normalize_unit(mention.unit)
+            survivors = _same_size_positions(index.catalog, pf, survivors, unit)
+            survivors = prefer_explicit(checks, numbers, survivors)
 
         survivors = prefer_by_words(phrase_words, survivors)
         return sorted(survivors, key=lambda p: p.row)
 
-    def _same_size_positions(
-        self, pf: PhraseFeatures, survivors: list[Position], unit: str | None
-    ) -> list[Position]:
-        """Материал не назван ни во фразе, ни в сообщении: «девятку протянули» — это может
-        быть медь, изоляция или капиллярная трубка. Все позиции с этим размером и той же ед.
-        (ед. из фразы, а если не названа — ед. кандидатов LLM)."""
-        units = {unit} if unit else {p.unit for p in survivors}
-        extra = [
-            p
-            for p in self.catalog.positions
-            if p.unit in units
-            and any(_same_size(x, d) for x in pf.diameters for d in p.features.diameters)
+
+# ─────────────── Вспомогательное ───────────────
+
+
+def _same_size_positions(
+    catalog: Catalog, pf: PhraseFeatures, survivors: list[Position], unit: str | None
+) -> list[Position]:
+    """Материал не назван ни во фразе, ни в сообщении: «девятку протянули» — это может
+    быть медь, изоляция или капиллярная трубка. Все позиции с этим размером и той же ед.
+    (ед. из фразы, а если не названа — ед. кандидатов LLM)."""
+    units = {unit} if unit else {p.unit for p in survivors}
+    extra = [
+        p
+        for p in catalog.positions
+        if p.unit in units
+        and any(_same_size(x, d) for x in pf.diameters for d in p.features.diameters)
+    ]
+    return list({p.row: p for p in survivors + extra}.values())
+
+
+def _by_previous_diameters(
+    item: MatchedItem, previous: list[MatchedItem], catalog: Catalog
+) -> list[MatchedItem]:
+    diameters: list[float] = []
+    for prev in previous:
+        pos = catalog.by_row(prev.row) if prev.row is not None else None
+        if pos and len(pos.features.diameters) == 1:
+            d = pos.features.diameters[0]
+            if d not in diameters:
+                diameters.append(d)
+    picks: list[int] = []
+    for d in diameters:
+        rows = [
+            r
+            for r in item.candidates
+            if (p := catalog.by_row(r)) and any(_same_size(d, x) for x in p.features.diameters)
         ]
-        return list({p.row: p for p in survivors + extra}.values())
+        if len(rows) != 1:
+            return []
+        picks.append(rows[0])
+    if not picks:
+        return []
+    status = MatchStatus.OK if item.qty else MatchStatus.CLARIFY
+    return [item.model_copy(update={"status": status, "row": r, "candidates": []}) for r in picks]
+
+
+def _split(mention: LlmMention) -> list[LlmMention]:
+    """Слитое упоминание («20а и 32а по одному») → по одному на значение признака.
+    Плюс объём и единица из текста, если LLM их перепутала («2 системы» → 1 шт)."""
+    parts = split_by_features(mention.phrase)
+    if parts is None:
+        return [_qty_from_text(mention)]
+    logger.debug("«{}» разделено на {} части", mention.phrase, len(parts))
+    out = []
+    for part in parts:
+        qty = part.qty if part.qty is not None else mention.qty
+        sub = mention.model_copy(update={"phrase": part.phrase, "qty": qty})
+        out.append(_qty_from_text(sub))
+    return out
+
+
+def _qty_from_text(mention: LlmMention) -> LlmMention:
+    found = find_quantities(mention.phrase)
+    if len(found) != 1:
+        return mention
+    q = found[0]
+    if mention.qty != q.value or normalize_unit(mention.unit) != q.unit:
+        logger.debug(
+            "«{}»: объём из текста {} {} вместо {} {}",
+            mention.phrase,
+            q.value,
+            q.unit,
+            mention.qty,
+            mention.unit,
+        )
+    return mention.model_copy(update={"qty": q.value, "unit": q.unit})
 
 
 def _missing_quantities(text: str, mentions: list[LlmMention]) -> list[str]:
-    """«Объём + единица» из сообщения, которых нет ни в одной фразе упоминаний."""
+    """«Объём + единица» из сообщения, которых не покрывает ни одно упоминание.
+
+    Упоминание покрывает объёмы из своей фразы. Если во фразе объёма нет, а в полях
+    qty/unit он есть (LLM вырезала «медь 6-ку», а 15 м положила в поля), — объём из полей.
+    Иначе это ложная тревога и лишний вызов LLM.
+    """
     found = Counter((q.value, q.unit) for q in find_quantities(text))
     covered: Counter[tuple[float, str]] = Counter()
     for m in mentions:
-        covered.update((q.value, q.unit) for q in find_quantities(m.phrase))
+        own = find_quantities(m.phrase)
+        if not own and m.qty is not None and m.unit:
+            # тот же разбор, что и для текста, — единицы нормализуются одинаково
+            own = find_quantities(f"{m.qty:g} {m.unit}")
+        covered.update((q.value, q.unit) for q in own)
     missing = found - covered
     return [f"{v:g} {u}" for (v, u), n in missing.items() for _ in range(n)]

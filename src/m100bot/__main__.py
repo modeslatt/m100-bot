@@ -14,7 +14,6 @@ from m100bot.config import Settings, get_settings
 from m100bot.matching.llm import LlmExtractor
 from m100bot.matching.matcher import Matcher
 from m100bot.services.report import ReportError, ReportService, run_outbox_worker
-from m100bot.sheets.catalog import Catalog
 from m100bot.sheets.client import SheetsClient
 from m100bot.storage.db import Storage
 
@@ -29,9 +28,7 @@ OUTBOX_INTERVAL_S = 60.0  # как часто разбирать очередь 
 def build_service(settings: Settings, storage: Storage) -> ReportService:
     """Собрать зависимости. Секреты читаются только из окружения (.env)."""
     sheets = SheetsClient.from_settings(settings)
-    llm = LlmExtractor.from_settings(settings)
-    # справочник матчер получит при первом отчёте (ReportService обновляет его сам)
-    matcher = Matcher(Catalog(positions=[], date_columns={}, last_col=9), llm)
+    matcher = Matcher(LlmExtractor.from_settings(settings))
     bitrix = (
         BitrixClient(settings.bitrix_webhook_url, settings.bitrix_entity_type_id)
         if settings.bitrix_webhook_url

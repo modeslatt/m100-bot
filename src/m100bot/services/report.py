@@ -27,9 +27,9 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from m100bot.matching.llm import compact_name
+from m100bot.matching.llm import LlmError
+from m100bot.matching.matcher import resolve_position
 from m100bot.matching.models import MatchedItem, MatchStatus
-from m100bot.matching.normalize import normalize_unit
 from m100bot.matching.phrase import synonym_key
 from m100bot.sheets.addressing import CellChange, Mode
 from m100bot.sheets.catalog import Catalog, Position
@@ -38,6 +38,9 @@ from m100bot.storage.db import Draft, NewWrite, OutboxItem, Storage, fold_writes
 
 BACKOFF_BASE_S = 30.0  # пауза перед второй попыткой отправки в Битрикс
 BACKOFF_MAX_S = 900.0  # дальше — раз в 15 минут, пока не получится
+# Общий предел на распознавание одного сообщения: повторы LLM и переспрос модели вместе
+# иначе могли бы держать мастера на «Разбираю отчёт…» до 8 минут
+RECOGNIZE_BUDGET_S = 180.0
 
 NO_DRAFT = "Нет отчёта для записи. Пришлите сообщение с работами."
 STALE = "Эта карточка устарела. Пришлите отчёт заново."
@@ -69,11 +72,8 @@ class BitrixLike(Protocol):
 
 
 class MatcherLike(Protocol):
-    catalog: Catalog
-
-    def refresh(self, catalog: Catalog, synonyms: dict[str, int] | None = None) -> None: ...
     async def match(
-        self, text: str, remaining: Mapping[int, float] | None = None
+        self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
     ) -> list[MatchedItem]: ...
 
 
@@ -111,19 +111,6 @@ def _safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}"[:300]
 
 
-def is_ready(item: MatchedItem) -> bool:
-    return (
-        item.status == MatchStatus.OK
-        and item.row is not None
-        and item.qty is not None
-        and item.qty > 0
-    )
-
-
-def _over(qty: float | None, left: float | None) -> bool:
-    return qty is not None and left is not None and qty > left + 1e-9
-
-
 class ReportService:
     def __init__(
         self,
@@ -133,6 +120,7 @@ class ReportService:
         bitrix: BitrixLike | None = None,
         *,
         timezone: str = "Europe/Minsk",
+        recognize_budget_s: float = RECOGNIZE_BUDGET_S,
         today: Callable[[], date] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -142,10 +130,11 @@ class ReportService:
         self.bitrix = bitrix  # None — Битрикс не настроен: в outbox ничего не кладём
         self._today = today or (lambda: datetime.now(ZoneInfo(timezone)).date())
         self._clock = clock
+        self._recognize_budget_s = recognize_budget_s
         self._user_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._flush_lock = asyncio.Lock()
         self._next_try: dict[int, float] = {}  # id задания outbox → когда можно повторить
-        self._synonyms_seen: dict[str, int] | None = None
+        self._last_synonyms: dict[str, int] = {}  # если лист «Синонимы» не прочитался
         self._background: set[asyncio.Task[None]] = set()
 
     # ─────────────── Справочные методы для бота ───────────────
@@ -183,21 +172,27 @@ class ReportService:
             return items
 
     async def _match(self, text: str) -> list[MatchedItem]:
+        """Распознать по свежему справочнику и отметить превышение остатка по смете."""
         catalog = await self.sheets.load_catalog()
         synonyms = await self._synonyms()
-        if self.matcher.catalog is not catalog or self._synonyms_seen is not synonyms:
-            self.matcher.refresh(catalog, synonyms)  # таблицу правят — подхватываем свежее
-            self._synonyms_seen = synonyms
+        try:
+            async with asyncio.timeout(self._recognize_budget_s):
+                items = await self.matcher.match(text, catalog, synonyms)
+        except TimeoutError as e:
+            logger.error("Распознавание не уложилось в {:.0f} с", self._recognize_budget_s)
+            raise LlmError("Распознавание заняло слишком много времени. Попробуйте позже.") from e
         remaining = await self._remaining_map(catalog)
-        return await self.matcher.match(text, remaining=remaining)
+        if remaining is None:
+            return items
+        return [i.with_remaining(remaining.get(i.row)) if i.row is not None else i for i in items]
 
     async def _synonyms(self) -> dict[str, int]:
         """Синонимы необязательны: без них бот работает, просто чаще переспрашивает."""
         try:
-            return await self.sheets.load_synonyms()
+            self._last_synonyms = await self.sheets.load_synonyms()
         except SheetsError as e:
-            logger.warning("Синонимы не прочитаны, работаю без них: {}", e)
-            return self._synonyms_seen or {}
+            logger.warning("Синонимы не прочитаны, работаю с последними известными: {}", e)
+        return self._last_synonyms
 
     async def _remaining_map(self, catalog: Catalog) -> dict[int, float] | None:
         """Остаток по смете (план − выполнено) для предупреждения ⚠️; нет данных — без него."""
@@ -236,31 +231,6 @@ class ReportService:
             raise StaleCardError(STALE)
         return draft.items[idx]
 
-    @staticmethod
-    def _resolve(item: MatchedItem, pos: Position, left: float | None) -> MatchedItem:
-        """Позиция выбрана: проверяем единицы и объём так же, как это делает матчер."""
-        unit = normalize_unit(item.unit)
-        update: dict[str, Any] = {
-            "row": pos.row,
-            "candidates": [],
-            "remaining": left,
-            "over_remaining": False,
-        }
-        if unit is not None and unit != pos.unit:
-            update |= {
-                "status": MatchStatus.CLARIFY,
-                "message": f"В смете «{pos.unit}», а указано «{unit}».",
-            }
-        elif item.qty is None or item.qty <= 0:
-            update |= {"status": MatchStatus.CLARIFY, "message": f"Сколько ({pos.unit})?"}
-        else:
-            update |= {
-                "status": MatchStatus.OK,
-                "message": None,
-                "over_remaining": _over(item.qty, left),
-            }
-        return item.model_copy(update=update)
-
     async def pick_variant(
         self, user_id: int, idx: int, row: int | None, *, token: str | None = None
     ) -> Draft:
@@ -270,12 +240,7 @@ class ReportService:
             item = self._item(draft, idx)
             if row is None:
                 new = item.model_copy(
-                    update={
-                        "status": MatchStatus.NOT_FOUND,
-                        "row": None,
-                        "candidates": [],
-                        "message": "Нужной позиции нет.",
-                    }
+                    update={"status": MatchStatus.NOT_FOUND, "row": None, "candidates": []}
                 )
             else:
                 if row not in item.candidates:
@@ -284,7 +249,8 @@ class ReportService:
                 pos = catalog.by_row(row)
                 if pos is None:
                     raise ReportError("Этой позиции больше нет в таблице. Пришлите отчёт заново.")
-                new = self._resolve(item, pos, await self._remaining_for(catalog, row))
+                left = await self._remaining_for(catalog, row)
+                new = resolve_position(item, pos).with_remaining(left)
                 new.picked = True  # после записи запомним фразу как синоним
             return await self._save(user_id, draft, idx, new)
 
@@ -305,15 +271,8 @@ class ReportService:
                 raise ReportError("Этой позиции больше нет в таблице. Пришлите отчёт заново.")
             left = await self._remaining_for(catalog, item.row)
             new = item.model_copy(
-                update={
-                    "qty": qty,
-                    "unit": pos.unit,
-                    "status": MatchStatus.OK,
-                    "message": None,
-                    "remaining": left,
-                    "over_remaining": _over(qty, left),
-                }
-            )
+                update={"qty": qty, "unit": pos.unit, "status": MatchStatus.OK}
+            ).with_remaining(left)
             return await self._save(user_id, draft, idx, new)
 
     async def remove_item(
@@ -379,10 +338,10 @@ class ReportService:
         """
         async with self._user_locks[user_id]:
             draft = await self._load(user_id, token)
-            ready = [i for i in draft.items if is_ready(i)]
+            ready = [i for i in draft.items if i.is_ready]
             skipped = [i for i in draft.items if i.status == MatchStatus.NOT_FOUND]
             leftover = [
-                i for i in draft.items if not is_ready(i) and i.status != MatchStatus.NOT_FOUND
+                i for i in draft.items if not i.is_ready and i.status != MatchStatus.NOT_FOUND
             ]
             if not ready:
                 raise ReportError(
@@ -481,7 +440,7 @@ class ReportService:
                 leftover=None,
                 what="Исправление записано в таблицу",
             )
-            name = compact_name(pos.name)
+            name = pos.short_name
             if qty == 0:
                 was = f"{fmt_qty(old or 0)} {pos.unit}"
                 return f"✅ Очищено за {today:%d.%m.%Y}: {name} (было {was})"
@@ -500,20 +459,6 @@ class ReportService:
             pos = catalog.by_row(row)
             lines.append(TodayLine(row, self._name(pos, row), totals[row], pos.unit if pos else ""))
         return today, lines
-
-    # ─────────────── Остаток ───────────────
-
-    async def remaining(self, row: int) -> tuple[float, float, str]:
-        """(план, выполнено, ед.) для ответа «сколько осталось по …».
-
-        Строка не позиция → ValueError; ошибки таблицы — `SheetsError`.
-        """
-        catalog = await self.sheets.load_catalog()
-        pos = catalog.by_row(row)
-        if pos is None:
-            raise ValueError(f"строка {row} не является позицией сметы")
-        done = (await self.sheets.read_done([row])).get(row, 0.0)
-        return pos.planned, done, pos.unit
 
     # ─────────────── Внутреннее: таблица ───────────────
 
@@ -610,7 +555,7 @@ class ReportService:
 
     @staticmethod
     def _name(pos: Position | None, row: int) -> str:
-        return compact_name(pos.name) if pos else f"строка {row}"
+        return pos.short_name if pos else f"строка {row}"
 
     def _describe(self, catalog: Catalog, row: int, qty: float) -> str:
         """«Фреонопровод медный, Д6,35 — 15 м»."""

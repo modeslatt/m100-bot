@@ -3,7 +3,7 @@
 import pytest
 
 from m100bot.matching.matcher import Matcher
-from m100bot.matching.models import LlmMention, LlmResponse, MatchStatus
+from m100bot.matching.models import LlmMention, LlmResponse, MatchedItem, MatchStatus
 from m100bot.sheets.catalog import Catalog
 
 
@@ -22,8 +22,8 @@ def m(phrase: str, candidates: list[int], qty: float | None = 1, unit: str | Non
 
 
 @pytest.fixture
-def matcher(catalog: Catalog) -> Matcher:
-    return Matcher(catalog, FakeLlm())
+def matcher() -> Matcher:
+    return Matcher(FakeLlm())
 
 
 @pytest.mark.parametrize(
@@ -59,33 +59,19 @@ def matcher(catalog: Catalog) -> Matcher:
         (m("фреонку 12.7 положили 30", [19], 30, None), "ok", 19, []),
     ],
 )
-def test_validate(matcher: Matcher, mention, status, row, candidates) -> None:
-    item = matcher.validate(mention)
+def test_validate(catalog: Catalog, matcher: Matcher, mention, status, row, candidates) -> None:
+    item = matcher.validate(mention, catalog)
     assert (item.status, item.row, item.candidates) == (MatchStatus(status), row, candidates)
 
 
-def test_validate_message_for_master(matcher: Matcher) -> None:
-    item = matcher.validate(m("короб 25х16 6 метров", [67], 6, "м"))
-    assert item.message and "шт" in item.message
-
-
-def test_synonym_overrides_features(catalog: Catalog) -> None:
-    matcher = Matcher(catalog, FakeLlm(), synonyms={"гофра 20": 64})
-    item = matcher.validate(
-        m("гофра 20", [], 32, "м"), synonym_row=matcher._synonym_row("гофра 20 32 м")
-    )
+def test_synonym_overrides_features(catalog: Catalog, matcher: Matcher) -> None:
+    item = matcher.validate(m("гофра 20 32 м", [], 32, "м"), catalog, {"гофра 20": 64})
     assert (item.status, item.row) == (MatchStatus.OK, 64)
-
-
-async def test_match_marks_over_remaining(catalog: Catalog) -> None:
-    llm = FakeLlm(m("медь 6-ка 15 м", [17], 15, "м"), m("кабель 3х2.5 56 м", [55], 56, "м"))
-    items = await Matcher(catalog, llm).match("…", remaining={17: 10, 55: 100})
-    assert [(i.row, i.over_remaining) for i in items] == [(17, True), (55, False)]
 
 
 async def test_match_empty_text_skips_llm(catalog: Catalog) -> None:
     llm = FakeLlm()
-    assert await Matcher(catalog, llm).match("   ") == []
+    assert await Matcher(llm).match("   ", catalog) == []
     assert llm.calls == 0
 
 
@@ -116,25 +102,28 @@ async def test_match_empty_text_skips_llm(catalog: Catalog) -> None:
         (m("трасса 1/4", [17, 20], 14, "м"), "ok", 17, []),
     ],
 )
-def test_select_variants(matcher: Matcher, mention, status, row, candidates) -> None:
-    item = matcher.validate(mention)
+def test_select_variants(
+    catalog: Catalog, matcher: Matcher, mention, status, row, candidates
+) -> None:
+    item = matcher.validate(mention, catalog)
     assert (item.status, item.row, item.candidates) == (MatchStatus(status), row, candidates)
 
 
 def test_no_sibling_expansion_when_disabled(catalog: Catalog) -> None:
-    strict = Matcher(catalog, FakeLlm(), expand_siblings=False)
-    assert strict.validate(m("кабель полторашку 30 м", [55], 30, "м")).status == "not_found"
+    strict = Matcher(FakeLlm(), expand_siblings=False)
+    item = strict.validate(m("кабель полторашку 30 м", [55], 30, "м"), catalog)
+    assert item.status == "not_found"
 
 
 async def test_split_merged_mention(catalog: Catalog) -> None:
     llm = FakeLlm(m("автоматы 20А и 32А по одному", [61, 62, 63], 1, "шт"))
-    items = await Matcher(catalog, llm).match("автоматы 20А и 32А по одному")
+    items = await Matcher(llm).match("автоматы 20А и 32А по одному", catalog)
     assert [(i.status, i.row, i.qty) for i in items] == [("ok", 62, 1), ("ok", 63, 1)]
 
 
 async def test_qty_from_text_beats_llm(catalog: Catalog) -> None:
     llm = FakeLlm(m("пнр мультисплита 2 системы", [51], 1, "шт"))
-    [item] = await Matcher(catalog, llm).match("пнр мультисплита 2 системы")
+    [item] = await Matcher(llm).match("пнр мультисплита 2 системы", catalog)
     assert (item.status, item.row, item.qty, item.unit) == ("ok", 51, 2, "сист")
 
 
@@ -144,8 +133,8 @@ async def test_reference_to_previous_diameters(catalog: Catalog) -> None:
         m("9-ку 15 м", [18], 15, "м"),
         m("изоляцию на них столько же", [20, 21, 22], 15, "м"),
     )
-    items = await Matcher(catalog, llm).match(
-        "медь 6-ку 15 м и 9-ку 15 м, изоляцию на них столько же"
+    items = await Matcher(llm).match(
+        "медь 6-ку 15 м и 9-ку 15 м, изоляцию на них столько же", catalog
     )
     assert [(i.row, i.qty) for i in items] == [(17, 15), (18, 15), (20, 15), (21, 15)]
 
@@ -168,46 +157,78 @@ async def test_reasks_when_quantity_lost(catalog: Catalog) -> None:
         [m("медь 6-ку 15 м", [17], 15, "м")],
         [m("медь 6-ку 15 м", [17], 15, "м"), m("9-ку 15 м", [18], 15, "м")],
     )
-    items = await Matcher(catalog, llm).match(text)
+    items = await Matcher(llm).match(text, catalog)
     assert [i.row for i in items] == [17, 18]
     assert len(llm.texts) == 2 and "пропущены" in llm.texts[1]
 
 
+async def test_no_reask_when_quantity_only_in_fields(catalog: Catalog) -> None:
+    """LLM вырезала фразу без числа, но объём положила в qty/unit — это не потеря."""
+    llm = SequenceLlm([m("медь 6-ку", [17], 15, "метров")])
+    items = await Matcher(llm).match("медь 6-ку 15 м", catalog)
+    assert len(llm.texts) == 1
+    assert [(i.row, i.qty) for i in items] == [(17, 15)]
+
+
+async def test_reasks_when_fields_cover_only_one_of_two(catalog: Catalog) -> None:
+    """Два одинаковых объёма в тексте, упоминание одно — переспрос нужен."""
+    llm = SequenceLlm(
+        [m("медь 6-ку", [17], 15, "м")],
+        [m("медь 6-ку", [17], 15, "м"), m("9-ку", [18], 15, "м")],
+    )
+    items = await Matcher(llm).match("медь 6-ку 15 м и 9-ку 15 м", catalog)
+    assert len(llm.texts) == 2
+    assert [i.row for i in items] == [17, 18]
+
+
 async def test_no_reask_when_complete(catalog: Catalog) -> None:
     llm = SequenceLlm([m("кабель 3х2,5 — 56 м", [55], 56, "м")])
-    await Matcher(catalog, llm).match("кабель 3х2,5 — 56 м")
+    await Matcher(llm).match("кабель 3х2,5 — 56 м", catalog)
     assert len(llm.texts) == 1
 
 
-def test_refresh_replaces_catalog_and_synonyms(catalog: Catalog) -> None:
-    """Бот живёт долго, таблицу правят: после refresh матчер работает по новому справочнику."""
-    matcher = Matcher(catalog, FakeLlm(), synonyms={"гофра": 64})
+def test_matcher_uses_catalog_from_call(catalog: Catalog, matcher: Matcher) -> None:
+    """Таблицу правят: матчер ничего не хранит и работает по справочнику из вызова."""
     smaller = Catalog(
         [p for p in catalog.positions if p.row != 56], catalog.date_columns, catalog.last_col
     )
-
-    matcher.refresh(smaller, {"ГОФРА  20": 65})
-
-    assert matcher.catalog is smaller
-    assert matcher.synonyms == {"гофра 20": 65}  # старые синонимы заменены, ключи нормализованы
-    item = matcher.validate(m("кабель полторашку 30 м", [55], 30, "м"))
+    item = matcher.validate(m("кабель полторашку 30 м", [55], 30, "м"), smaller)
     assert item.candidates == [57, 60]  # варианты кабеля берутся уже без удалённой строки 56
 
 
-def test_learned_synonym_ignores_quantity(catalog: Catalog) -> None:
-    matcher = Matcher(catalog, FakeLlm(), synonyms={"хомутов": 44})
-    assert matcher._synonym_row("12 хомутов", 12) == 44
-    assert matcher._synonym_row("хомутов 5 штук", 5) == 44  # другая формулировка и объём
-    assert matcher._synonym_row("тройник 25", 3) is None  # чужая фраза не совпадает
+@pytest.mark.parametrize(
+    ("phrase", "qty", "row"),
+    [
+        ("12 хомутов", 12, 44),
+        ("хомутов 5 штук", 5, 44),  # другая формулировка и объём
+        ("поставили 3 хомутов", 3, 44),  # глагол не мешает
+        ("тройник 25", 3, None),  # чужая фраза не совпадает
+    ],
+)
+def test_learned_synonym_ignores_quantity(
+    catalog: Catalog, matcher: Matcher, phrase: str, qty: float, row: int | None
+) -> None:
+    item = matcher.validate(m(phrase, [], qty, "шт"), catalog, {"Хомутов": 44})
+    assert item.row == row
+
+
+def test_sheet_synonym_with_quantity_still_matches(catalog: Catalog, matcher: Matcher) -> None:
+    """На листе «Синонимы» фразу могли вписать вручную с объёмом и глаголом."""
+    item = matcher.validate(m("гофра 20", [], 32, "м"), catalog, {"проложили гофра 20 32 м": 64})
+    assert item.row == 64
 
 
 async def test_match_resolves_ambiguous_phrase_by_learned_synonym(catalog: Catalog) -> None:
     llm = FakeLlm(m("поставили 12 хомутов", [43, 44], 12, "шт"))
-    items = await Matcher(catalog, llm, synonyms={"хомутов": 44}).match("поставили 12 хомутов")
+    items = await Matcher(llm).match("поставили 12 хомутов", catalog, {"хомутов": 44})
     assert [(i.status, i.row, i.qty) for i in items] == [(MatchStatus.OK, 44, 12)]
 
 
-async def test_match_keeps_remaining_with_over_flag(catalog: Catalog) -> None:
-    llm = FakeLlm(m("медь 6-ка 15 м", [17], 15, "м"))
-    [item] = await Matcher(catalog, llm).match("…", remaining={17: 10})
-    assert (item.over_remaining, item.remaining) == (True, 10)
+@pytest.mark.parametrize(
+    ("qty", "left", "over"),
+    [(15, 10, True), (10, 10, False), (5, None, False), (None, 10, False)],
+)
+def test_with_remaining_marks_over(qty: float | None, left: float | None, over: bool) -> None:
+    item = MatchedItem(phrase="…", qty=qty, unit="м", status=MatchStatus.OK, row=17)
+    marked = item.with_remaining(left)
+    assert (marked.over_remaining, marked.remaining) == (over, left)

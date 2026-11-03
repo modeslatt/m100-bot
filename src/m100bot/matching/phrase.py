@@ -7,7 +7,12 @@ LLM на CPU (qwen3:8b) путает объёмы и сливает упомин
 import re
 from dataclasses import dataclass
 
-from m100bot.matching.features import CABLE_WORDS, extract_phrase_features
+from m100bot.matching.features import (
+    CABLE_WORDS,
+    FRACTION,
+    SLANG_WORDS,
+    extract_phrase_features,
+)
 from m100bot.matching.normalize import normalize_text, normalize_unit
 
 # ─────────────── Объём с единицей ───────────────
@@ -31,22 +36,16 @@ class Quantity:
     end: int
 
 
-def _unit(raw: str) -> str:
-    if raw in ("м2", "м3"):
-        return raw
-    for prefix, unit in (("метр", "м"), ("шт", "шт"), ("сист", "сист"), ("компл", "компл")):
-        if raw.startswith(prefix):
-            return unit
-    if raw.startswith("килограм"):
-        return "кг"
-    return normalize_unit(raw) or raw
-
-
 def find_quantities(text: str) -> list[Quantity]:
     """Все «число + единица» в нормализованном тексте."""
     t = normalize_text(text)
     return [
-        Quantity(float(m.group("num")), _unit(m.group("unit")), m.start(), m.end())
+        Quantity(
+            float(m.group("num")),
+            normalize_unit(m.group("unit")) or m.group("unit"),
+            m.start(),
+            m.end(),
+        )
         for m in _QTY.finditer(t)
     ]
 
@@ -103,8 +102,8 @@ def words(text: str) -> list[str]:
 # «20а», «32 ампер», «на 16» — ток; дроби, жаргон и «6-ку» — диаметр; «4х1.5» — сечение
 _SPLIT_PATTERNS = [
     re.compile(r"(?<![\d.])\d{1,3}\s*(?:а|ампер\w*)\b"),
-    re.compile(r"(?<![\d./])(?:1/4|3/8|1/2|5/8|3/4)(?![\d/])"),
-    re.compile(r"\bшестер\w*|\bдевят(?:к|очк)\w*|\bдвена(?:шк|дцатк)\w*"),
+    FRACTION,
+    re.compile("|".join(rx.pattern for rx, _ in SLANG_WORDS)),
     re.compile(r"(?<![\d.])\d{1,2}-[а-я]{1,3}\b"),
     re.compile(r"(?<![\d.])[2-5]х\d+(?:\.\d+)?(?![\d.])"),
 ]

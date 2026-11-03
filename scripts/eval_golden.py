@@ -61,7 +61,7 @@ async def main() -> int:
     s = LlmSettings(_env_file=ROOT / ".env")  # type: ignore[call-arg]
     ws = openpyxl.load_workbook(ROOT / "tests/fixtures/sample.xlsx").active
     catalog = parse_catalog([list(r) for r in ws.iter_rows(values_only=True)])
-    matcher = Matcher(catalog, LlmExtractor.from_settings(s))
+    matcher = Matcher(LlmExtractor.from_settings(s))
 
     cases = yaml.safe_load((ROOT / "tests/golden/phrases.yaml").read_text(encoding="utf-8"))
     cases = [c for c in cases if args.k in c["id"]]
@@ -73,7 +73,7 @@ async def main() -> int:
         exp = Counter(exp_key(e) for e in c["expected"])
         t0 = time.perf_counter()
         try:
-            got = Counter(got_key(i) for i in await matcher.match(c["text"]))
+            got = Counter(got_key(i) for i in await matcher.match(c["text"], catalog))
             got_s = fmt(got)
         except LlmError as e:
             got, got_s = Counter(), f"ошибка LLM: {e}"

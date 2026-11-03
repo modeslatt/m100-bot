@@ -6,6 +6,8 @@
 """
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,7 +19,9 @@ from loguru import logger
 from m100bot.bot import render
 from m100bot.bot.keyboards import (
     Act,
+    CardAction,
     Today,
+    TodayAction,
     back_keyboard,
     choice_keyboard,
     edit_pick_keyboard,
@@ -31,7 +35,7 @@ from m100bot.bot.keyboards import (
 )
 from m100bot.bot.states import ReportFlow
 from m100bot.matching.llm import LlmError
-from m100bot.services.report import ReportError, ReportService, StaleCardError, is_ready
+from m100bot.services.report import ReportError, ReportService, StaleCardError
 from m100bot.sheets.client import SheetsError
 from m100bot.storage.db import Draft
 
@@ -250,6 +254,22 @@ async def on_report(message: Message, state: FSMContext, bot: Bot, service: Repo
 # ─────────────── Ответы текстом в режимах ───────────────
 
 
+async def read_number(
+    message: Message, state: FSMContext, bot: Bot, service: ReportService
+) -> float | None:
+    """Число из ответа мастера. Не число: длинный текст — это новый отчёт (разбираем его),
+    короткий — просим ответить цифрами. В обоих случаях None."""
+    assert message.text is not None
+    qty = render.parse_qty(message.text)
+    if qty is not None:
+        return qty
+    if render.looks_like_report(message.text):
+        await process_report(message, state, bot, service)
+    else:
+        await message.answer(render.BAD_NUMBER)
+    return None
+
+
 async def on_qty_input(
     message: Message, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
@@ -257,12 +277,8 @@ async def on_qty_input(
     if message.from_user is None or not message.text:
         return
     uid, chat_id = message.from_user.id, message.chat.id
-    qty = render.parse_qty(message.text)
+    qty = await read_number(message, state, bot, service)
     if qty is None:
-        if render.looks_like_report(message.text):  # это не число, а новый отчёт
-            await process_report(message, state, bot, service)
-        else:
-            await message.answer(render.BAD_NUMBER)
         return
     data = await state.get_data()
     try:
@@ -310,12 +326,8 @@ async def on_today_qty(
     if message.from_user is None or not message.text:
         return
     uid, chat_id = message.from_user.id, message.chat.id
-    qty = render.parse_qty(message.text)
+    qty = await read_number(message, state, bot, service)
     if qty is None:
-        if render.looks_like_report(message.text):
-            await process_report(message, state, bot, service)
-        else:
-            await message.answer(render.BAD_NUMBER)
         return
     data = await state.get_data()
     try:
@@ -336,135 +348,186 @@ async def on_today_qty(
 # ─────────────── Кнопки карточки ───────────────
 
 
-async def act(
-    call: CallbackQuery, cb: Act, state: FSMContext, bot: Bot, service: ReportService
-) -> None:
-    """Действие над карточкой. Ошибки (в т.ч. устаревшая карточка) ловит guarded()."""
+@dataclass(frozen=True)
+class Tap:
+    """Нажатие кнопки: всё, что нужно обработчику действия."""
+
+    bot: Bot
+    service: ReportService
+    state: FSMContext
+    uid: int
+    master: str  # имя мастера в Telegram — для журнала и Битрикса
+    chat_id: int
+    msg_id: int  # сообщение, под которым нажата кнопка
+    data: dict[str, Any]  # данные режима (FSM) на момент нажатия
+
+    async def refresh(self, card_id: int | None) -> None:
+        await refresh(self.bot, self.chat_id, self.service, self.state, self.uid, card_id=card_id)
+
+
+async def make_tap(call: CallbackQuery, state: FSMContext, bot: Bot, service: ReportService) -> Tap:
     assert call.message is not None
-    uid, chat_id, msg_id = call.from_user.id, call.message.chat.id, call.message.message_id
-    data = await state.get_data()
-
-    if cb.a == "ok":
-        draft = await service.get_draft(uid, token=cb.t)
-        assert draft is not None
-        rows = sorted({i.row for i in draft.items if is_ready(i) and i.row is not None})
-        summary = await service.confirm(
-            uid, service.today(), master=call.from_user.full_name, token=cb.t
-        )
-        link = service.table_link(rows[0] if rows else None)
-        await edit_or_send(bot, chat_id, msg_id, summary, sheet_link_keyboard(link))
-        await delete_quietly(bot, chat_id, data.get("question_id"))
-        await state.clear()
-        if await service.get_draft(uid) is not None:  # остались позиции, требующие ответа
-            await refresh(bot, chat_id, service, state, uid, card_id=None)
-
-    elif cb.a == "edit":
-        draft = await service.get_draft(uid, token=cb.t)
-        assert draft is not None
-        await edit_or_send(
-            bot,
-            chat_id,
-            msg_id,
-            render.EDIT_PICK,
-            edit_pick_keyboard(draft.token, len(draft.items)),
-        )
-        await state.update_data(card_id=msg_id)
-
-    elif cb.a == "item":
-        draft = await service.get_draft(uid, token=cb.t)
-        assert draft is not None
-        if not 0 <= cb.i < len(draft.items):
-            raise StaleCardError("Эта карточка устарела. Пришлите отчёт заново.")
-        item = draft.items[cb.i]
-        await state.update_data(card_id=msg_id)
-        if render.needs_choice(item):  # неоднозначная — снова спрашиваем про неё
-            await show_card(bot, chat_id, service, state, uid, edit_id=msg_id)
-            await ask(bot, chat_id, service, state, uid, only_idx=cb.i)
-            return
-        catalog = await service.catalog()
-        text = render.item_edit_text(cb.i + 1, item, catalog)
-        await edit_or_send(bot, chat_id, msg_id, text, item_edit_keyboard(draft.token, cb.i))
-        if item.row is not None:
-            await state.set_state(ReportFlow.editing_qty)
-            await state.update_data(idx=cb.i, token=draft.token)
-
-    elif cb.a in ("del", "qdel"):
-        # qdel нажата под вопросом, а карточка — отдельное сообщение
-        card_id = msg_id if cb.a == "del" else data.get("card_id")
-        draft = await service.remove_item(uid, cb.i, token=cb.t)
-        await state.set_state(None)
-        if cb.a == "qdel":
-            await delete_quietly(bot, chat_id, msg_id)
-            await state.update_data(question_id=None)
-        if draft is None:
-            await edit_or_send(bot, chat_id, card_id, render.EMPTY_REPORT)
-            await delete_quietly(bot, chat_id, data.get("question_id"))
-            await state.clear()
-        else:
-            await refresh(bot, chat_id, service, state, uid, card_id=card_id)
-
-    elif cb.a == "pick":
-        await service.pick_variant(uid, cb.i, cb.r or None, token=cb.t)
-        await state.set_state(None)
-        await delete_quietly(bot, chat_id, msg_id)  # вопрос, на который ответили
-        await state.update_data(question_id=None)
-        await refresh(bot, chat_id, service, state, uid, card_id=data.get("card_id"))
-
-    elif cb.a == "add":
-        draft = await service.get_draft(uid, token=cb.t)
-        assert draft is not None
-        await edit_or_send(bot, chat_id, msg_id, render.ADD_PROMPT, back_keyboard(draft.token))
-        await state.set_state(ReportFlow.adding)
-        await state.update_data(card_id=msg_id, token=draft.token)
-
-    elif cb.a == "back":
-        await service.get_draft(uid, token=cb.t)  # устаревшую карточку не оживляем
-        await state.set_state(None)
-        await refresh(bot, chat_id, service, state, uid, card_id=msg_id)
-
-    elif cb.a == "cancel":
-        await service.get_draft(uid, token=cb.t)
-        await service.cancel(uid)
-        await edit_or_send(bot, chat_id, msg_id, render.CANCELLED)
-        await delete_quietly(bot, chat_id, data.get("question_id"))
-        await state.clear()
+    return Tap(
+        bot,
+        service,
+        state,
+        call.from_user.id,
+        call.from_user.full_name,
+        call.message.chat.id,
+        call.message.message_id,
+        await state.get_data(),
+    )
 
 
-async def act_today(
-    call: CallbackQuery, cb: Today, state: FSMContext, bot: Bot, service: ReportService
-) -> None:
-    assert call.message is not None
-    uid, chat_id, msg_id = call.from_user.id, call.message.chat.id, call.message.message_id
+async def card_ok(t: Tap, cb: Act) -> None:
+    """«Записать»: в таблицу, затем итог на месте карточки; неразобранное — новой карточкой."""
+    draft = await t.service.get_draft(t.uid, token=cb.t)
+    assert draft is not None
+    rows = sorted({i.row for i in draft.items if i.is_ready and i.row is not None})
+    summary = await t.service.confirm(t.uid, t.service.today(), master=t.master, token=cb.t)
+    link = t.service.table_link(rows[0] if rows else None)
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, summary, sheet_link_keyboard(link))
+    await delete_quietly(t.bot, t.chat_id, t.data.get("question_id"))
+    await t.state.clear()
+    if await t.service.get_draft(t.uid) is not None:  # остались позиции, требующие ответа
+        await t.refresh(card_id=None)
 
-    if cb.a == "edit":
-        _, lines = await service.today_report(uid)
-        if not lines:
-            await show_today(bot, chat_id, service, uid, edit_id=msg_id)
-            return
-        await edit_or_send(bot, chat_id, msg_id, render.EDIT_PICK, today_pick_keyboard(lines))
 
-    elif cb.a == "row":
-        _, lines = await service.today_report(uid)
-        line = next((ln for ln in lines if ln.row == cb.r), None)
-        if line is None:  # строку уже очистили
-            await state.clear()
-            await show_today(bot, chat_id, service, uid, edit_id=msg_id)
-            return
-        await state.set_state(ReportFlow.correcting_today)
-        await state.update_data(row=cb.r, today_msg=msg_id)
-        await edit_or_send(
-            bot, chat_id, msg_id, render.today_item_text(line), today_item_keyboard(cb.r)
-        )
+async def card_edit(t: Tap, cb: Act) -> None:
+    """«Исправить»: выбрать номер позиции."""
+    draft = await t.service.get_draft(t.uid, token=cb.t)
+    assert draft is not None
+    keyboard = edit_pick_keyboard(draft.token, len(draft.items))
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.EDIT_PICK, keyboard)
+    await t.state.update_data(card_id=t.msg_id)
 
-    elif cb.a == "clear":
-        result = await service.correct_today(uid, cb.r, 0, master=call.from_user.full_name)
-        await state.clear()
-        await show_today(bot, chat_id, service, uid, edit_id=msg_id)
-        await bot.send_message(chat_id, result)
 
-    elif cb.a == "back":
-        await state.clear()
-        await show_today(bot, chat_id, service, uid, edit_id=msg_id)
+async def card_item(t: Tap, cb: Act) -> None:
+    """Выбрана позиция для исправления: неоднозначную — переспросить, остальные — ждать число."""
+    draft = await t.service.get_draft(t.uid, token=cb.t)
+    assert draft is not None
+    if not 0 <= cb.i < len(draft.items):
+        raise StaleCardError("Эта карточка устарела. Пришлите отчёт заново.")
+    item = draft.items[cb.i]
+    await t.state.update_data(card_id=t.msg_id)
+    if render.needs_choice(item):
+        await show_card(t.bot, t.chat_id, t.service, t.state, t.uid, edit_id=t.msg_id)
+        await ask(t.bot, t.chat_id, t.service, t.state, t.uid, only_idx=cb.i)
+        return
+    catalog = await t.service.catalog()
+    text = render.item_edit_text(cb.i + 1, item, catalog)
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, text, item_edit_keyboard(draft.token, cb.i))
+    if item.row is not None:
+        await t.state.set_state(ReportFlow.editing_qty)
+        await t.state.update_data(idx=cb.i, token=draft.token)
+
+
+async def card_delete(t: Tap, cb: Act) -> None:
+    """Удалить позицию: из меню исправления (del) или под вопросом «сколько?» (qdel)."""
+    # qdel нажата под вопросом, а карточка — отдельное сообщение
+    card_id = t.msg_id if cb.a == "del" else t.data.get("card_id")
+    draft = await t.service.remove_item(t.uid, cb.i, token=cb.t)
+    await t.state.set_state(None)
+    if cb.a == "qdel":
+        await delete_quietly(t.bot, t.chat_id, t.msg_id)
+        await t.state.update_data(question_id=None)
+    if draft is None:
+        await edit_or_send(t.bot, t.chat_id, card_id, render.EMPTY_REPORT)
+        await delete_quietly(t.bot, t.chat_id, t.data.get("question_id"))
+        await t.state.clear()
+    else:
+        await t.refresh(card_id=card_id)
+
+
+async def card_pick(t: Tap, cb: Act) -> None:
+    """Ответ на вопрос «какой вариант?» (r=0 — «Нет нужного»)."""
+    await t.service.pick_variant(t.uid, cb.i, cb.r or None, token=cb.t)
+    await t.state.set_state(None)
+    await delete_quietly(t.bot, t.chat_id, t.msg_id)  # вопрос, на который ответили
+    await t.state.update_data(question_id=None)
+    await t.refresh(card_id=t.data.get("card_id"))
+
+
+async def card_add(t: Tap, cb: Act) -> None:
+    """«Добавить»: следующий текст мастера допишется к отчёту."""
+    draft = await t.service.get_draft(t.uid, token=cb.t)
+    assert draft is not None
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.ADD_PROMPT, back_keyboard(draft.token))
+    await t.state.set_state(ReportFlow.adding)
+    await t.state.update_data(card_id=t.msg_id, token=draft.token)
+
+
+async def card_back(t: Tap, cb: Act) -> None:
+    await t.service.get_draft(t.uid, token=cb.t)  # устаревшую карточку не оживляем
+    await t.state.set_state(None)
+    await t.refresh(card_id=t.msg_id)
+
+
+async def card_cancel(t: Tap, cb: Act) -> None:
+    await t.service.get_draft(t.uid, token=cb.t)
+    await t.service.cancel(t.uid)
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.CANCELLED)
+    await delete_quietly(t.bot, t.chat_id, t.data.get("question_id"))
+    await t.state.clear()
+
+
+CARD_ACTIONS: dict[CardAction, Callable[[Tap, Act], Awaitable[None]]] = {
+    "ok": card_ok,
+    "edit": card_edit,
+    "item": card_item,
+    "del": card_delete,
+    "qdel": card_delete,
+    "pick": card_pick,
+    "add": card_add,
+    "back": card_back,
+    "cancel": card_cancel,
+}
+
+
+# ─────────────── Кнопки /today ───────────────
+
+
+async def today_edit(t: Tap, cb: Today) -> None:
+    """«Исправить» в /today: выбрать строку."""
+    _, lines = await t.service.today_report(t.uid)
+    if not lines:
+        await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
+        return
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.EDIT_PICK, today_pick_keyboard(lines))
+
+
+async def today_row(t: Tap, cb: Today) -> None:
+    """Выбрана строка: ждём новый объём числом."""
+    _, lines = await t.service.today_report(t.uid)
+    line = next((ln for ln in lines if ln.row == cb.r), None)
+    if line is None:  # строку уже очистили
+        await t.state.clear()
+        await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
+        return
+    await t.state.set_state(ReportFlow.correcting_today)
+    await t.state.update_data(row=cb.r, today_msg=t.msg_id)
+    text, keyboard = render.today_item_text(line), today_item_keyboard(cb.r)
+    await edit_or_send(t.bot, t.chat_id, t.msg_id, text, keyboard)
+
+
+async def today_clear(t: Tap, cb: Today) -> None:
+    result = await t.service.correct_today(t.uid, cb.r, 0, master=t.master)
+    await t.state.clear()
+    await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
+    await t.bot.send_message(t.chat_id, result)
+
+
+async def today_back(t: Tap, cb: Today) -> None:
+    await t.state.clear()
+    await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
+
+
+TODAY_ACTIONS: dict[TodayAction, Callable[[Tap, Today], Awaitable[None]]] = {
+    "edit": today_edit,
+    "row": today_row,
+    "clear": today_clear,
+    "back": today_back,
+}
 
 
 async def guarded(call: CallbackQuery, bot: Bot, action: Callable[[], Awaitable[None]]) -> None:
@@ -493,13 +556,21 @@ async def guarded(call: CallbackQuery, bot: Bot, action: Callable[[], Awaitable[
 async def on_act(
     call: CallbackQuery, callback_data: Act, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
-    await guarded(call, bot, lambda: act(call, callback_data, state, bot, service))
+    async def run() -> None:
+        tap = await make_tap(call, state, bot, service)
+        await CARD_ACTIONS[callback_data.a](tap, callback_data)
+
+    await guarded(call, bot, run)
 
 
 async def on_today_act(
     call: CallbackQuery, callback_data: Today, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
-    await guarded(call, bot, lambda: act_today(call, callback_data, state, bot, service))
+    async def run() -> None:
+        tap = await make_tap(call, state, bot, service)
+        await TODAY_ACTIONS[callback_data.a](tap, callback_data)
+
+    await guarded(call, bot, run)
 
 
 # ─────────────── Сборка роутера ───────────────
