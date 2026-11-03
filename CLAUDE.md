@@ -61,7 +61,7 @@ src/m100bot/
   matching/matcher.py   гибрид: синонимы → LLM → валидатор признаков/ед. изм. → статус
   matching/models.py    pydantic-модели результата
   bitrix/client.py      вебхук Битрикс24, retry
-  voice/transcribe.py   голос → текст (локально faster-whisper; опционально облачный API)
+  voice/transcribe.py   голос → текст: Whisper через Groq (OpenAI-совместимый API) ✅ готово
   storage/db.py         SQLite: черновики, журнал записей, outbox для Битрикса ✅ готово
   services/report.py    сценарий: распознать → подтвердить → записать → журнал ✅ готово
                         (Битрикс — только через outbox + flush_outbox(); фоновый запуск — в __main__)

@@ -21,6 +21,7 @@ from m100bot.services.report import ReportService
 from m100bot.sheets.catalog import Catalog
 from m100bot.sheets.client import SheetsError
 from m100bot.storage.db import Storage
+from m100bot.voice.transcribe import TranscribeError
 
 D = date(2026, 11, 2)
 NOW = datetime(2026, 11, 2, 9, tzinfo=UTC)  # 12:00 по Минску
@@ -58,18 +59,40 @@ class Env:
     bitrix: FakeBitrix
     service: ReportService
     storage: Storage
+    transcriber: "FakeTranscriber | None" = None
 
 
-async def make_env(tmp_path: Path, catalog: Catalog, allowed: tuple[int, ...] = ()) -> Env:
+class FakeTranscriber:
+    """Whisper без сети: возвращает заданный текст или бросает заданную ошибку."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.error: Exception | None = None
+        self.audio: list[bytes] = []
+
+    async def transcribe(self, audio: bytes, filename: str = "voice.ogg") -> str:
+        self.audio.append(audio)
+        if self.error:
+            raise self.error
+        return self.text
+
+
+async def make_env(
+    tmp_path: Path,
+    catalog: Catalog,
+    allowed: tuple[int, ...] = (),
+    transcriber: FakeTranscriber | None = None,
+) -> Env:
     # черновики «создаются» в тот же день, что и сегодняшняя дата бота
     storage = Storage(tmp_path / "bot.sqlite3", now=lambda: NOW)
     await storage.init()
     sheets, matcher, bitrix = FakeSheets(catalog), FakeMatcher(), FakeBitrix()
     service = ReportService(sheets, storage, matcher, bitrix, today=lambda: D)
-    dp = build_dispatcher(service, allowed)
+    dp = build_dispatcher(service, allowed, transcriber)  # type: ignore[arg-type]
     session = FakeSession()
     bot = Bot("123456:TEST", session=session)
-    return Env(Chat(dp, bot, session), dp, bot, session, sheets, matcher, bitrix, service, storage)
+    chat = Chat(dp, bot, session)
+    return Env(chat, dp, bot, session, sheets, matcher, bitrix, service, storage, transcriber)
 
 
 @pytest.fixture
@@ -587,7 +610,7 @@ async def test_unknown_command_voice_and_other_content(env: Env) -> None:
     await env.chat.say("/foo")
     assert env.chat.find("Не знаю такой команды. Список: /help")
     await env.chat.send_voice()
-    assert env.chat.find("Голос пока не поддерживается")
+    assert env.chat.find("Голосовые не настроены. Пришлите отчёт текстом.")
     await env.chat.send_photo()
     assert env.chat.find("Пришлите отчёт текстом.")
 
@@ -636,3 +659,71 @@ async def test_empty_allowed_list_means_open_for_everyone(env: Env) -> None:
     env.matcher.items = [ok(17, 15)]
     await other.say("медь")
     assert other.card().text.startswith("Отчёт за")
+
+
+# ─────────────── Голос ───────────────
+
+
+@pytest.fixture
+async def voice(tmp_path: Path, catalog: Catalog) -> AsyncIterator[Env]:
+    e = await make_env(tmp_path, catalog, transcriber=FakeTranscriber())
+    yield e
+    await e.service.drain()
+    await e.storage.close()
+
+
+async def test_voice_report_shows_transcript_then_card(voice: Env) -> None:
+    assert voice.transcriber is not None
+    voice.transcriber.text = "Проложили медь шестёрку 15 метров"
+    voice.matcher.items = [ok(17, 15)]
+
+    await voice.chat.send_voice()
+
+    assert voice.transcriber.audio == [voice.session.file_bytes]  # скачан файл из Telegram
+    assert voice.chat.find("Распознал: «Проложили медь шестёрку 15 метров»")
+    assert voice.matcher.seen[-1][0] == "Проложили медь шестёрку 15 метров"
+    assert "1. ✅ Фреонопровод медный, Д6,35 TEC TUBE cips — 15 м" in voice.chat.card().text
+
+
+async def test_voice_answers_how_many(voice: Env) -> None:
+    """На вопрос «сколько?» можно ответить голосом, и числом словами тоже."""
+    assert voice.transcriber is not None
+    await report(voice, clarify_qty(17))
+    voice.transcriber.text = "Пятнадцать метров."
+
+    await voice.chat.send_voice()
+
+    assert "1. ✅ Фреонопровод медный, Д6,35 TEC TUBE cips — 15 м" in voice.chat.card().text
+
+
+async def test_voice_adds_to_todays_report(voice: Env) -> None:
+    assert voice.transcriber is not None
+    await report(voice, ok(17, 15))
+    voice.transcriber.text = "и гофру двадцатку сорок метров"
+    voice.matcher.items = [ok(64, 40)]
+
+    await voice.chat.send_voice()
+
+    draft = await voice.storage.get_draft(1)
+    assert draft is not None and [i.row for i in draft.items] == [17, 64]
+
+
+async def test_too_long_voice_is_refused(voice: Env) -> None:
+    assert voice.transcriber is not None
+    await voice.chat.send_voice(duration=301)
+    assert voice.chat.find("Голосовое длиннее 5 минут.")
+    assert voice.transcriber.audio == []  # даже не скачивали
+
+
+async def test_transcription_error_is_shown(voice: Env) -> None:
+    assert voice.transcriber is not None
+    voice.transcriber.error = TranscribeError("Сервис распознавания голоса не отвечает.")
+    await voice.chat.send_voice()
+    assert voice.chat.texts() == ["Сервис распознавания голоса не отвечает."]
+    assert voice.matcher.seen == []
+
+
+async def test_silence_is_not_a_report(voice: Env) -> None:
+    await voice.chat.send_voice()  # Whisper вернул пустой текст
+    assert voice.chat.texts() == ["Не расслышал. Повторите голосовое или пришлите текстом."]
+    assert voice.matcher.seen == []

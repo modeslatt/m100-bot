@@ -16,6 +16,7 @@ from m100bot.matching.matcher import Matcher
 from m100bot.services.report import ReportError, ReportService, run_outbox_worker
 from m100bot.sheets.client import SheetsClient
 from m100bot.storage.db import Storage
+from m100bot.voice.transcribe import Transcriber
 
 COMMANDS = [
     BotCommand(command="today", description="Что записано сегодня"),
@@ -54,7 +55,10 @@ async def main() -> None:
         logger.error("Таблица недоступна при запуске: {}", e)
 
     bot = Bot(settings.bot_token)
-    dp = build_dispatcher(service, settings.allowed_user_ids)
+    transcriber = Transcriber.from_settings(settings)
+    if transcriber is None:
+        logger.info("Голосовые не настроены (STT_API_KEY пуст) — бот просит присылать текст")
+    dp = build_dispatcher(service, settings.allowed_user_ids, transcriber)
     worker = (
         asyncio.create_task(run_outbox_worker(service, OUTBOX_INTERVAL_S))
         if service.bitrix is not None

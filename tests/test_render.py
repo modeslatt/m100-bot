@@ -163,3 +163,28 @@ def test_item_edit_text(catalog: Catalog) -> None:
     )
     gone = MatchedItem(phrase="стена", qty=1, unit="м", status=MatchStatus.NOT_FOUND)
     assert render.item_edit_text(1, gone, catalog).endswith("Её можно только удалить.")
+
+
+@pytest.mark.parametrize(
+    ("text", "qty"),
+    [
+        ("15", 15),
+        ("7,5 м", 7.5),
+        ("Пятнадцать.", 15),
+        ("пятнадцать метров", 15),
+        ("двести сорок пять", 245),
+        ("сто", 100),
+        ("семь с половиной метров", 7.5),
+        ("полтора", 1.5),
+        ("ноль", 0),
+        ("три штуки", 3),
+        # не число или число не целиком — лучше переспросить
+        ("пятнадцать пять", None),
+        ("пять двадцать", None),
+        ("медь шестёрка", None),
+        ("много", None),
+        ("", None),
+    ],
+)
+def test_parse_qty_digits_and_words(text: str, qty: float | None) -> None:
+    assert render.parse_qty(text) == qty

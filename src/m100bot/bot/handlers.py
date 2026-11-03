@@ -11,7 +11,7 @@ from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from loguru import logger
@@ -39,6 +39,7 @@ from m100bot.matching.llm import LlmError
 from m100bot.services.report import ReportError, ReportService, StaleCardError
 from m100bot.sheets.client import SheetsError
 from m100bot.storage.db import Draft
+from m100bot.voice.transcribe import TranscribeError, Transcriber
 
 # Ошибки, тексты которых уже написаны для мастера
 USER_ERRORS = (ReportError, SheetsError, LlmError)
@@ -208,20 +209,18 @@ async def on_unknown_command(message: Message) -> None:
     await message.answer(render.UNKNOWN_COMMAND)
 
 
-async def on_voice(message: Message) -> None:
-    # TODO: скачать файл → Transcriber → тот же путь, что и текст (process_report)
-    await message.answer(render.VOICE_STUB)
-
-
 async def on_other(message: Message) -> None:
     await message.answer(render.OTHER_CONTENT)
 
 
 # ─────────────── Новый отчёт ───────────────
+#
+# Ядро сценария принимает текст параметром: его даёт и текстовое сообщение, и голосовое
+# после распознавания. Хэндлер сообщений — тонкая обёртка (см. on_text и on_voice).
 
 
 async def process_report(
-    message: Message, state: FSMContext, bot: Bot, service: ReportService
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
     """Текст мастера → карточка.
 
@@ -229,23 +228,16 @@ async def process_report(
     мастер часто присылает работы по одной, и молча стирать прежние нельзя. Есть
     вчерашний (или старше) — спрашиваем, дописать в него или начать новый.
     """
-    if message.from_user is None or not message.text:
+    if message.from_user is None:
         return
     uid, chat_id = message.from_user.id, message.chat.id
     draft = await service.get_draft(uid)
     if draft is not None and service.draft_day(draft) != service.today():
-        await ask_about_stale_draft(message, state, service, draft)
+        await ask_about_stale_draft(message, text, state, service, draft)
         return
     placeholder = await message.answer(render.THINKING)
     await recognize_into_card(
-        bot,
-        chat_id,
-        service,
-        state,
-        uid,
-        message.text,
-        placeholder.message_id,
-        append=draft is not None,
+        bot, chat_id, service, state, uid, text, placeholder.message_id, append=draft is not None
     )
 
 
@@ -289,51 +281,46 @@ async def recognize_into_card(
 
 
 async def ask_about_stale_draft(
-    message: Message, state: FSMContext, service: ReportService, draft: Draft
+    message: Message, text: str, state: FSMContext, service: ReportService, draft: Draft
 ) -> None:
     """Незаписанный отчёт за прошлый день: текст откладываем, мастер решает кнопкой."""
     n = len(draft.items)
-    text = render.STALE_DRAFT.format(
+    question = render.STALE_DRAFT.format(
         day=service.draft_day(draft),
         n=n,
         word=render.plural(n, ("позиция", "позиции", "позиций")),
     )
     await state.set_state(None)
-    await state.update_data(pending_text=message.text)
-    await message.answer(text, reply_markup=stale_draft_keyboard(draft.token))
+    await state.update_data(pending_text=text)
+    await message.answer(question, reply_markup=stale_draft_keyboard(draft.token))
 
 
-async def on_report(message: Message, state: FSMContext, bot: Bot, service: ReportService) -> None:
-    await process_report(message, state, bot, service)
-
-
-# ─────────────── Ответы текстом в режимах ───────────────
+# ─────────────── Ответы в режимах ───────────────
 
 
 async def read_number(
-    message: Message, state: FSMContext, bot: Bot, service: ReportService
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
 ) -> float | None:
-    """Число из ответа мастера. Не число: длинный текст — это новый отчёт (разбираем его),
-    короткий — просим ответить цифрами. В обоих случаях None."""
-    assert message.text is not None
-    qty = render.parse_qty(message.text)
+    """Число из ответа мастера («15», «7,5», «пятнадцать»). Не число: длинный текст — это
+    новые работы (разбираем их), короткий — просим ответить числом. В обоих случаях None."""
+    qty = render.parse_qty(text)
     if qty is not None:
         return qty
-    if render.looks_like_report(message.text):
-        await process_report(message, state, bot, service)
+    if render.looks_like_report(text):
+        await process_report(message, text, state, bot, service)
     else:
         await message.answer(render.BAD_NUMBER)
     return None
 
 
-async def on_qty_input(
-    message: Message, state: FSMContext, bot: Bot, service: ReportService
+async def answer_qty(
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
     """Ответ числом: на вопрос «сколько?» или новый объём при «Исправить»."""
-    if message.from_user is None or not message.text:
+    if message.from_user is None:
         return
     uid, chat_id = message.from_user.id, message.chat.id
-    qty = await read_number(message, state, bot, service)
+    qty = await read_number(message, text, state, bot, service)
     if qty is None:
         return
     data = await state.get_data()
@@ -350,17 +337,17 @@ async def on_qty_input(
     await refresh(bot, chat_id, service, state, uid, card_id=data.get("card_id"))
 
 
-async def on_add_text(
-    message: Message, state: FSMContext, bot: Bot, service: ReportService
+async def add_text(
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
-    """«Добавить»: ещё позиции текстом — дописываются в конец отчёта."""
-    if message.from_user is None or not message.text:
+    """«Добавить»: ещё позиции — дописываются в конец отчёта."""
+    if message.from_user is None:
         return
     uid, chat_id = message.from_user.id, message.chat.id
     data = await state.get_data()
     await bot.send_chat_action(chat_id, "typing")
     try:
-        _, added = await service.append(uid, message.text, token=data.get("token"))
+        _, added = await service.append(uid, text, token=data.get("token"))
     except StaleCardError as e:
         await state.clear()
         await message.answer(str(e))
@@ -375,14 +362,14 @@ async def on_add_text(
     await refresh(bot, chat_id, service, state, uid, card_id=data.get("card_id"))
 
 
-async def on_today_qty(
-    message: Message, state: FSMContext, bot: Bot, service: ReportService
+async def correct_today_qty(
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
     """Новый объём для строки, записанной сегодня."""
-    if message.from_user is None or not message.text:
+    if message.from_user is None:
         return
     uid, chat_id = message.from_user.id, message.chat.id
-    qty = await read_number(message, state, bot, service)
+    qty = await read_number(message, text, state, bot, service)
     if qty is None:
         return
     data = await state.get_data()
@@ -399,6 +386,71 @@ async def on_today_qty(
     except USER_ERRORS as e:
         logger.warning("Список «сегодня» не обновлён: {}", e)
     await message.answer(result)
+
+
+TextStep = Callable[[Message, str, FSMContext, Bot, ReportService], Awaitable[None]]
+
+# Что значит текст мастера в каждом режиме; вне режимов — это работы для отчёта
+TEXT_STEPS: dict[str | None, TextStep] = {
+    ReportFlow.editing_qty.state: answer_qty,
+    ReportFlow.adding.state: add_text,
+    ReportFlow.correcting_today.state: correct_today_qty,
+}
+
+
+async def handle_text(
+    message: Message, text: str, state: FSMContext, bot: Bot, service: ReportService
+) -> None:
+    """Текст (набранный или распознанный из голоса) — по текущему режиму."""
+    step = TEXT_STEPS.get(await state.get_state(), process_report)
+    await step(message, text, state, bot, service)
+
+
+async def on_text(message: Message, state: FSMContext, bot: Bot, service: ReportService) -> None:
+    if message.text:
+        await handle_text(message, message.text, state, bot, service)
+
+
+# ─────────────── Голос ───────────────
+
+VOICE_MAX_S = 300  # длиннее — просим разбить: дольше ждать, дороже и больше ошибок
+
+
+async def on_voice(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    service: ReportService,
+    transcriber: Transcriber | None,
+) -> None:
+    """Голосовое → текст (Whisper) → «Распознал: …» → тот же путь, что и для текста."""
+    voice = message.voice
+    if voice is None:
+        return
+    if transcriber is None:
+        await message.answer(render.VOICE_STUB)
+        return
+    if voice.duration > VOICE_MAX_S:
+        await message.answer(render.VOICE_TOO_LONG)
+        return
+    status = await message.answer(render.LISTENING)
+    try:
+        audio = await bot.download(voice)
+        if audio is None:
+            raise RuntimeError("пустой файл голосового")
+        text = await transcriber.transcribe(audio.read())
+    except TranscribeError as e:
+        await edit_or_send(bot, message.chat.id, status.message_id, str(e))
+        return
+    except Exception:
+        logger.exception("Не удалось получить или распознать голосовое")
+        await edit_or_send(bot, message.chat.id, status.message_id, render.VOICE_FAILED)
+        return
+    if not text:
+        await edit_or_send(bot, message.chat.id, status.message_id, render.VOICE_EMPTY)
+        return
+    await edit_or_send(bot, message.chat.id, status.message_id, render.heard(text))
+    await handle_text(message, text, state, bot, service)
 
 
 # ─────────────── Кнопки карточки ───────────────
@@ -668,13 +720,8 @@ def build_router() -> Router:
     r.message.register(on_table, Command("table"))
     r.message.register(on_today, Command("today"))
     r.message.register(on_voice, F.voice)
-
-    # ответы в режимах — раньше общего обработчика текста
-    r.message.register(on_qty_input, StateFilter(ReportFlow.editing_qty), F.text, not_command)
-    r.message.register(on_add_text, StateFilter(ReportFlow.adding), F.text, not_command)
-    r.message.register(on_today_qty, StateFilter(ReportFlow.correcting_today), F.text, not_command)
-
-    r.message.register(on_report, F.text, not_command)
+    # текст — по текущему режиму (ответ числом, «Добавить», новые работы): см. TEXT_STEPS
+    r.message.register(on_text, F.text, not_command)
     r.message.register(on_unknown_command, F.text)
     r.message.register(on_other)
 

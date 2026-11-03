@@ -45,12 +45,12 @@ class Settings(LlmSettings, SheetsSettings):
     # NoDecode: иначе pydantic-settings читает пустое «ALLOWED_USER_IDS=» как JSON и падает
     allowed_user_ids: Annotated[list[int], NoDecode] = []
 
-    # Speech-to-text
-    stt_provider: str = "local"  # local (faster-whisper) | api (OpenAI-совместимый)
-    stt_model: str = "small"
-    stt_device: str = "cpu"
-    stt_base_url: str = ""
+    # Голос → текст: Whisper через OpenAI-совместимый API (по умолчанию Groq).
+    # Ключ пуст — голосовые не принимаются, бот просит прислать текст.
+    stt_base_url: str = "https://api.groq.com/openai/v1"
     stt_api_key: str = ""
+    stt_model: str = "whisper-large-v3-turbo"
+    stt_timeout_s: float = 60
 
     # Bitrix24
     bitrix_webhook_url: str = ""

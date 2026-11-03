@@ -17,11 +17,12 @@ from aiogram.methods import (
     DeleteMessage,
     EditMessageReplyMarkup,
     EditMessageText,
+    GetFile,
     SendMessage,
     TelegramMethod,
 )
 from aiogram.types import Chat as TgChat
-from aiogram.types import InlineKeyboardMarkup, Message
+from aiogram.types import File, InlineKeyboardMarkup, Message
 
 Button = tuple[str, str]  # (подпись, callback_data или url)
 
@@ -54,14 +55,14 @@ class FakeSession(BaseSession):
         self.methods: list[TelegramMethod[Any]] = []
         self.alerts: list[tuple[str | None, bool | None]] = []
         self.edit_errors: set[int] = set()  # сообщения, которые нельзя изменить
+        self.file_bytes = b"OggS fake voice"  # содержимое любого скачиваемого файла
         self._next_id = 1000
 
     async def close(self) -> None:
         return None
 
     async def stream_content(self, *args: Any, **kwargs: Any):  # type: ignore[override]
-        if False:
-            yield b""
+        yield self.file_bytes
 
     async def make_request(self, bot: Bot, method: TelegramMethod[Any], timeout: int | None = None):
         self.methods.append(method)
@@ -94,6 +95,8 @@ class FakeSession(BaseSession):
             if rec := self.messages.get(method.message_id):
                 rec.deleted = True
             return True
+        if isinstance(method, GetFile):
+            return File(file_id=method.file_id, file_unique_id="u", file_path="voice/f.oga")
         if isinstance(method, AnswerCallbackQuery):
             self.alerts.append((method.text, method.show_alert))
             return True
@@ -156,9 +159,9 @@ class Chat:
             msg["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
         await self._feed(message=msg)
 
-    async def send_voice(self) -> None:
+    async def send_voice(self, duration: int = 3) -> None:
         msg = self._base_message() | {
-            "voice": {"file_id": "f", "file_unique_id": "u", "duration": 3}
+            "voice": {"file_id": "f", "file_unique_id": "u", "duration": duration}
         }
         await self._feed(message=msg)
 
