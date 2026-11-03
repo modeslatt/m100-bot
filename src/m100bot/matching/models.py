@@ -51,6 +51,10 @@ class MatchedItem(BaseModel):
     candidates: list[int] = []  # варианты для кнопок при AMBIGUOUS
     over_remaining: bool = False  # объём больше остатка по смете
     remaining: float | None = None  # сколько осталось по смете (для «осталось 12 м»)
+    # Отпечаток позиции на момент, когда её увидел мастер: № из колонки A и название.
+    # Перед записью сверяется с таблицей — если строки сдвинули, объём не уйдёт в соседнюю.
+    pos_number: int | None = None
+    pos_name: str | None = None
 
     @property
     def is_ready(self) -> bool:

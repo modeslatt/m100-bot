@@ -12,8 +12,9 @@ gspread синхронный — вызовы оборачиваем в asyncio.
 """
 
 import asyncio
+import math
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,8 +39,10 @@ from m100bot.sheets.addressing import (
     CellChange,
     CellNotNumericError,
     Mode,
+    RowId,
     build_row_link,
     cell,
+    cell_numbers,
     col_letter,
     column_range,
     column_values,
@@ -50,8 +53,10 @@ from m100bot.sheets.addressing import (
     insert_date_column_requests,
     parse_synonyms,
     plan_date_column,
+    row_id,
     sheet_value,
     two_column_values,
+    validate_volumes,
 )
 from m100bot.sheets.catalog import (
     COL_DONE,
@@ -60,7 +65,6 @@ from m100bot.sheets.catalog import (
     DATE_ROW,
     FIRST_DATA_ROW,
     Catalog,
-    Position,
     parse_catalog,
     parse_date_columns,
 )
@@ -78,6 +82,13 @@ class SheetsError(RuntimeError):
 
 class SheetChangedError(SheetsError):
     """Таблицу изменили (сдвинули строки), пока отчёт ждал подтверждения."""
+
+
+class WriteConflictError(SheetsError):
+    """Прерванную запись нельзя ни подтвердить, ни повторить: ячейки уже не «до» и не «после»."""
+
+
+BeforeWrite = Callable[[list[CellChange]], Awaitable[None]]
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -166,28 +177,108 @@ class SheetsClient:
                 self.invalidate_cache()
 
     async def write_volumes(
-        self, d: date, volumes: dict[int, float], *, mode: Mode = "add"
+        self,
+        d: date,
+        volumes: dict[int, float],
+        *,
+        mode: Mode = "add",
+        expected: Mapping[int, RowId] | None = None,
+        before_write: BeforeWrite | None = None,
     ) -> list[CellChange]:
         """Записать объёмы за дату одним batch_update. Возвращает, что было и что стало.
 
-        mode='add' — прибавить к значению в ячейке, 'set' — заменить (0 очищает ячейку).
-        Перед записью сверяем № и название строк с таблицей: если строки сдвинули —
-        SheetChangedError и ничего не пишем. Эталон для сверки — справочник, который клиент
-        загрузил последним (по нему мастер видел позиции), даже если кэш уже устарел:
-        перечитать его перед записью значило бы сравнивать таблицу саму с собой.
+        mode: add — прибавить, set — заменить (0 очищает ячейку), delta — прибавить разницу.
+        expected — отпечатки позиций (№ и название), которые видел мастер: если в таблице
+        по этим строкам уже другое (строки сдвинули) — SheetChangedError, ничего не пишем.
+        Для строк без отпечатка эталон — последний загруженный справочник.
+        before_write(changes) вызывается после расчёта, до записи: сюда вызывающий кладёт
+        «намерение», чтобы после потерянного ответа понять, дошла ли запись (`resume_write`).
         """
         if not volumes:
             return []
-        compute_changes({}, volumes, mode)  # проверка аргументов до обращения к сети
-        catalog = self._catalog or await self.load_catalog()
-        unknown = sorted(r for r in volumes if catalog.by_row(r) is None)
-        if unknown:
-            raise ValueError(f"строки {unknown} не являются позициями сметы")
+        validate_volumes(volumes, mode)  # до обращения к сети
+        ids = await self._row_ids(volumes, expected)
         async with self._lock:
             try:
-                return await asyncio.to_thread(self._write_sync, d, volumes, mode)
+                col = await asyncio.to_thread(self._call, self._ensure_once, d)
+                current = await asyncio.to_thread(
+                    self._call, self._read_state_once, col, sorted(volumes), ids
+                )
+                try:
+                    changes = compute_changes(current, volumes, mode)
+                except CellNotNumericError as e:
+                    raise SheetsError(
+                        f"В таблице в строке {e.row} за эту дату стоит не число — "
+                        "исправьте вручную."
+                    ) from e
+                if not changes:
+                    return []
+                if before_write is not None:
+                    await before_write(changes)
+                await asyncio.to_thread(self._call, self._write_once, col, changes)
+                logger.info(
+                    "Записано в столбец {} ({}): {}",
+                    col_letter(col),
+                    mode,
+                    ", ".join(f"{c.row}: {c.old:g}→{c.new:g}" for c in changes),
+                )
+                return changes
             finally:
                 self.invalidate_cache()
+
+    async def resume_write(
+        self, d: date, changes: list[CellChange], *, expected: Mapping[int, RowId] | None = None
+    ) -> list[CellChange]:
+        """Довести прерванную запись (ответ Sheets потерялся, процесс упал до журнала).
+
+        Ячейки уже «после» — запись дошла, ничего не пишем. Все ещё «до» — пишем те же
+        значения. Иначе (кто-то менял ячейки) — WriteConflictError: молча не трогаем.
+        """
+        if not changes:
+            return []
+        rows = sorted(c.row for c in changes)
+        ids = await self._row_ids(dict.fromkeys(rows, 0.0), expected)
+        async with self._lock:
+            try:
+                col = await asyncio.to_thread(self._call, self._ensure_once, d)
+                current = await asyncio.to_thread(self._call, self._read_state_once, col, rows, ids)
+                try:
+                    now = cell_numbers(current, rows)
+                except CellNotNumericError as e:
+                    raise WriteConflictError(
+                        f"В таблице в строке {e.row} за эту дату стоит не число — "
+                        "проверьте вручную."
+                    ) from e
+                if all(math.isclose(now[c.row], c.new, abs_tol=1e-6) for c in changes):
+                    logger.info("Прерванная запись за {} уже в таблице — повторно не пишу", d)
+                    return changes
+                if all(math.isclose(now[c.row], c.old, abs_tol=1e-6) for c in changes):
+                    await asyncio.to_thread(self._call, self._write_once, col, changes)
+                    logger.info("Прерванная запись за {} выполнена повторно", d)
+                    return changes
+                logger.error("Прерванная запись за {}: ячейки изменились: {}", d, now)
+                raise WriteConflictError(
+                    "Ячейки в таблице изменились после прерванной записи — проверьте их вручную."
+                )
+            finally:
+                self.invalidate_cache()
+
+    async def _row_ids(
+        self, volumes: Mapping[int, float], expected: Mapping[int, RowId] | None
+    ) -> dict[int, RowId]:
+        """Отпечатки строк для сверки: переданные, а для остальных — из справочника."""
+        ids = {r: expected[r] for r in volumes if expected and r in expected}
+        missing = [r for r in volumes if r not in ids]
+        if missing:
+            catalog = self._catalog or await self.load_catalog()
+            unknown = sorted(r for r in missing if catalog.by_row(r) is None)
+            if unknown:
+                raise ValueError(f"строки {unknown} не являются позициями сметы")
+            for r in missing:
+                pos = catalog.by_row(r)
+                assert pos is not None
+                ids[r] = row_id(pos)
+        return ids
 
     async def read_volumes(self, d: date, rows: Iterable[int]) -> dict[int, float]:
         """Объёмы за дату по строкам (пустая ячейка = 0). Даты нет в таблице — все нули."""
@@ -332,50 +423,25 @@ class SheetsClient:
         logger.info("Создан столбец {} для даты {}", col_letter(plan.col), d)
         return plan.col
 
-    def _reference_catalog(self) -> Catalog:
-        """Справочник, по которому мастер видел позиции: последний загруженный (даже устаревший)."""
-        return self._catalog if self._catalog is not None else self._load_catalog_once()
-
-    def _write_sync(self, d: date, volumes: dict[int, float], mode: Mode) -> list[CellChange]:
-        col = self._call(self._ensure_once, d)
-        changes = self._call(self._read_changes_once, col, volumes, mode)
-        if changes:
-            self._call(self._write_once, col, changes)
-            logger.info(
-                "Записано в столбец {} ({}): {}",
-                col_letter(col),
-                mode,
-                ", ".join(f"{c.row}: {c.old:g}→{c.new:g}" for c in changes),
-            )
-        return changes
-
-    def _read_changes_once(
-        self, col: int, volumes: dict[int, float], mode: Mode
-    ) -> list[CellChange]:
-        """Читает таблицу, сверяет строки со справочником, считает новые значения. Только чтение."""
+    def _read_state_once(
+        self, col: int, rows: list[int], ids: Mapping[int, RowId]
+    ) -> dict[int, Any]:
+        """Сверить № и названия строк с отпечатками и прочитать ячейки даты. Только чтение."""
         ws = self._worksheet()
-        catalog = self._reference_catalog()
-        first, last = min(volumes), max(volumes)
+        first, last = min(rows), max(rows)
         ab_a1 = f"{col_letter(COL_NUM)}{first}:{col_letter(COL_NAME)}{last}"
         ab_raw, cur_raw = ws.batch_get(
             [ab_a1, column_range(col, first, last)],
             value_render_option=ValueRenderOption.unformatted,
         )
         ab = two_column_values(first, [list(r) for r in ab_raw])
-        positions: list[Position] = [p for r in volumes if (p := catalog.by_row(r)) is not None]
-        shifted = find_shifted_rows(positions, ab)
+        shifted = find_shifted_rows(ids, ab)
         if shifted:
-            logger.error("Строки {} в таблице не совпадают со справочником", shifted)
+            logger.error("Строки {} в таблице не совпадают с тем, что видел мастер", shifted)
             raise SheetChangedError(
                 "Таблицу изменили: строки сместились. Обновите отчёт и повторите."
             )
-        current = column_values(first, [list(r) for r in cur_raw])
-        try:
-            return compute_changes(current, volumes, mode)
-        except CellNotNumericError as e:
-            raise SheetsError(
-                f"В таблице в строке {e.row} за эту дату стоит не число — исправьте вручную."
-            ) from e
+        return column_values(first, [list(r) for r in cur_raw])
 
     def _write_once(self, col: int, changes: list[CellChange]) -> None:
         """Одна batch_update на весь отчёт. Значения абсолютные → повтор безопасен."""

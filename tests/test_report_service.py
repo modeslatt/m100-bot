@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import Counter
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -10,17 +10,20 @@ from typing import Any
 
 import pytest
 
+from m100bot.bitrix.client import BitrixError
 from m100bot.matching.llm import LlmError
 from m100bot.matching.models import Intent, MatchedItem, MatchStatus, Understood
 from m100bot.services.report import (
+    BACKOFF_MAX_S,
+    PERMANENT_RETRY_S,
     ReportError,
     ReportService,
     backoff_seconds,
     distribute_correction,
 )
-from m100bot.sheets.addressing import CellChange, Mode
+from m100bot.sheets.addressing import CellBelowZeroError, CellChange, Mode, RowId
 from m100bot.sheets.catalog import Catalog
-from m100bot.sheets.client import SheetChangedError, SheetsError
+from m100bot.sheets.client import SheetChangedError, SheetsError, WriteConflictError
 from m100bot.storage.db import NewWrite, Storage
 
 D = date(2026, 11, 2)
@@ -43,6 +46,10 @@ class FakeSheets:
         self.done_error: Exception | None = None
         self.synonyms_error: Exception | None = None
         self.writes: list[tuple[date, dict[int, float], str]] = []
+        self.lost_responses: list[Exception] = []  # ошибка ПОСЛЕ записи (ответ потерян)
+        self.shifted = False  # строки в таблице сдвинули
+        self.expected: list[dict[int, RowId]] = []  # отпечатки, переданные в write_volumes
+        self._lock = asyncio.Lock()  # как у SheetsClient: одна запись за раз
         self.calls: Counter[str] = Counter()
 
     async def load_catalog(self) -> Catalog:
@@ -64,19 +71,65 @@ class FakeSheets:
         return {r: self.done.get(r, 0.0) for r in rows}
 
     async def write_volumes(
-        self, d: date, volumes: dict[int, float], *, mode: Mode = "add"
+        self,
+        d: date,
+        volumes: dict[int, float],
+        *,
+        mode: Mode = "add",
+        expected: Mapping[int, RowId] | None = None,
+        before_write: Callable[[list[CellChange]], Awaitable[None]] | None = None,
+    ) -> list[CellChange]:
+        async with self._lock:
+            return await self._write(d, volumes, mode, expected, before_write)
+
+    async def _write(
+        self,
+        d: date,
+        volumes: dict[int, float],
+        mode: Mode,
+        expected: Mapping[int, RowId] | None,
+        before_write: Callable[[list[CellChange]], Awaitable[None]] | None,
     ) -> list[CellChange]:
         self.calls["write_volumes"] += 1
+        self.expected.append(dict(expected or {}))
         if self.write_errors:
             raise self.write_errors.pop(0)
+        if self.shifted:
+            raise SheetChangedError("строки сместились")
         changes = []
         for row, qty in sorted(volumes.items()):
+            if mode in ("add", "delta") and qty == 0:
+                continue
             old = self.cells.get((d, row), 0.0)
-            new = round(old + qty if mode == "add" else qty, 6)
-            self.cells[(d, row)] = new
+            new = round(old + qty if mode != "set" else qty, 6)
+            if new < 0:
+                raise CellBelowZeroError(row, old, qty)
             changes.append(CellChange(row, old, new))
+        if before_write is not None:
+            await before_write(changes)
+        self._apply(d, changes)
         self.writes.append((d, dict(volumes), mode))
+        if self.lost_responses:  # запись дошла, а ответ потерялся
+            raise self.lost_responses.pop(0)
         return changes
+
+    async def resume_write(
+        self, d: date, changes: list[CellChange], *, expected: Mapping[int, RowId] | None = None
+    ) -> list[CellChange]:
+        self.calls["resume_write"] += 1
+        if self.write_errors:
+            raise self.write_errors.pop(0)
+        now = {c.row: self.cells.get((d, c.row), 0.0) for c in changes}
+        if all(now[c.row] == c.new for c in changes):
+            return changes
+        if all(now[c.row] == c.old for c in changes):
+            self._apply(d, changes)
+            return changes
+        raise WriteConflictError("ячейки изменились")
+
+    def _apply(self, d: date, changes: list[CellChange]) -> None:
+        for c in changes:
+            self.cells[(d, c.row)] = c.new
 
     def row_link(self, row: int) -> str:
         return f"https://sheet.test/edit#range=B{row}"
@@ -453,22 +506,124 @@ async def test_catalog_failure_stops_before_any_write(
     assert await storage.get_draft(USER) is not None
 
 
-async def test_journal_failure_after_sheets_write_says_do_not_repeat(
+async def test_journal_failure_then_retry_does_not_double(
     service: ReportService,
     sheets: FakeSheets,
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Таблица уже изменена, а сохранить журнал не вышло: повтор удвоил бы объёмы."""
+    """Таблица уже изменена, а журнал не сохранился. Повтор «Записать» видит по намерению,
+    что объёмы уже в таблице, и только дописывает журнал."""
+    real = storage.record_confirmation
 
     async def broken(*a: Any, **kw: Any) -> None:
         raise OSError("диск недоступен")
 
     monkeypatch.setattr(storage, "record_confirmation", broken)
     await draft(storage, ok(17, 15))
-    with pytest.raises(ReportError, match="Повторно не нажимайте"):
+    with pytest.raises(ReportError, match="не удвоит"):
         await service.confirm(USER, D)
     assert sheets.cells[(D, 17)] == 15  # запись в таблице есть
+
+    monkeypatch.setattr(storage, "record_confirmation", real)
+    text = await service.confirm(USER, D)
+    assert text.startswith("✅ Записано")
+    assert sheets.cells[(D, 17)] == 15  # не 30
+    assert sheets.calls["resume_write"] == 1
+    assert [w.qty for w in await storage.get_writes()] == [15]
+    assert await storage.get_pending(USER) is None
+
+
+async def test_lost_response_then_retry_does_not_double(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    """Sheets записал, но ответ потерялся: мастер видит ошибку и жмёт ещё раз."""
+    sheets.lost_responses = [SheetsError("Таблица недоступна. Попробуйте позже.")]
+    await draft(storage, ok(17, 15), ok(44, 10))
+    with pytest.raises(ReportError, match="ещё раз"):
+        await service.confirm(USER, D)
+    assert sheets.cells[(D, 17)] == 15
+
+    await service.confirm(USER, D)
+
+    assert (sheets.cells[(D, 17)], sheets.cells[(D, 44)]) == (15, 10)
+    assert len(await storage.get_writes()) == 2
+    assert await storage.get_draft(USER) is None
+
+
+async def test_write_not_reached_sheet_then_retry_writes(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    """Намерение сохранено, а в таблицу не попало (процесс упал): повтор пишет."""
+    await draft(storage, ok(17, 15))
+    d = await storage.get_draft(USER)
+    assert d is not None
+    await storage.save_pending(USER, f"report:{d.token}", D, [CellChange(17, 0.0, 15.0)])
+
+    await service.confirm(USER, D)
+
+    assert sheets.cells[(D, 17)] == 15
+    assert sheets.calls["write_volumes"] == 0 and sheets.calls["resume_write"] == 1
+
+
+async def test_retry_after_cells_changed_asks_to_check(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15))
+    d = await storage.get_draft(USER)
+    assert d is not None
+    await storage.save_pending(USER, f"report:{d.token}", D, [CellChange(17, 0.0, 15.0)])
+    sheets.cells[(D, 17)] = 7  # ни «до», ни «после»
+
+    with pytest.raises(ReportError, match="Проверьте строки 17"):
+        await service.confirm(USER, D)
+    assert sheets.cells[(D, 17)] == 7  # ничего не тронули
+    assert await storage.get_pending(USER) is None  # решение — за мастером
+
+
+async def test_draft_is_frozen_while_write_is_unfinished(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    sheets.lost_responses = [SheetsError("Таблица недоступна.")]
+    await draft(storage, ok(17, 15), ambiguous())
+    with pytest.raises(ReportError):
+        await service.confirm(USER, D)
+    d = await storage.get_draft(USER)
+    assert d is not None
+
+    with pytest.raises(ReportError, match="Прошлая запись в таблицу прервалась"):
+        await service.pick_variant(USER, 1, 43, token=d.token)
+    service.matcher.items = [ok(18, 5)]  # type: ignore[attr-defined]
+    with pytest.raises(ReportError, match="Прошлая запись"):
+        await service.recognize(USER, "ещё медь 5 м", append=True)
+    with pytest.raises(ReportError, match="Прошлая запись"):
+        await service.correct_today(USER, 17, 1)
+
+    await service.cancel(USER)  # мастер отказался — намерение снято
+    assert await storage.get_pending(USER) is None
+
+
+async def test_rows_checked_against_what_master_saw(
+    service: ReportService, sheets: FakeSheets, storage: Storage, catalog: Catalog
+) -> None:
+    """В write_volumes уходит отпечаток позиции из черновика (№ и название)."""
+    pos = catalog.by_row(17)
+    assert pos is not None
+    item = ok(17, 15).model_copy(update={"pos_number": pos.number, "pos_name": pos.norm_name})
+    await draft(storage, item)
+    await service.confirm(USER, D)
+    assert sheets.expected[-1] == {17: (pos.number, pos.norm_name)}
+
+
+async def test_shifted_rows_block_write(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    sheets.shifted = True
+    await draft(storage, ok(17, 15))
+    with pytest.raises(ReportError, match="строки сместились"):
+        await service.confirm(USER, D)
+    assert sheets.cells == {}
+    assert await storage.get_pending(USER) is None  # до записи не дошло — намерения нет
 
 
 # ─────────────── Повторные и параллельные нажатия ───────────────
@@ -494,6 +649,44 @@ async def test_users_do_not_block_or_mix(
     await asyncio.gather(service.confirm(1, D), service.confirm(2, D))
     assert sheets.cells[(D, 17)] == 15
     assert {r.user_id for r in await storage.get_writes()} == {1, 2}
+
+
+class SlowMatcher:
+    """Распознаёт по тексту и уступает управление — как настоящая LLM, которая думает."""
+
+    async def understand(
+        self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
+    ) -> Understood:
+        await asyncio.sleep(0.01)
+        row = 17 if "медь" in text else 55
+        return Understood("report", [ok(row, 10, text)])
+
+
+async def test_two_messages_in_a_row_both_kept(sheets: FakeSheets, storage: Storage) -> None:
+    """Голосовое и сразу текст: оба решили «новый отчёт» до блокировки. Под блокировкой
+    второе видит черновик первого и дописывает, а не затирает."""
+    service = ReportService(sheets, storage, SlowMatcher(), today=lambda: D)  # type: ignore[arg-type]
+    await asyncio.gather(
+        service.recognize(USER, "медь 10 м", append=None),
+        service.recognize(USER, "кабель 10 м", append=None),
+    )
+    d = await storage.get_draft(USER)
+    assert d is not None
+    assert sorted(i.row for i in d.items) == [17, 55]
+
+
+async def test_draft_remembers_its_day(sheets: FakeSheets, storage: Storage) -> None:
+    day = [D]
+    service = ReportService(sheets, storage, FakeMatcher([ok(17, 15)]), today=lambda: day[0])
+    await service.recognize(USER, "медь 15 м")
+    day[0] = date(2026, 11, 3)
+    service.matcher = FakeMatcher([ok(55, 5)])
+    await service.recognize(USER, "кабель 5 м", append=True)  # дописали уже 03.11
+
+    d = await storage.get_draft(USER)
+    assert d is not None and service.draft_day(d) == D  # день отчёта — первое сообщение
+    await service.confirm(USER)
+    assert set(sheets.cells) == {(D, 17), (D, 55)}
 
 
 # ─────────────── Битрикс через outbox ───────────────
@@ -717,6 +910,21 @@ async def test_send_now_failure_stays_in_outbox(
     assert (await service.flush_outbox()).sent == 1
 
 
+async def test_bitrix_config_error_retried_hourly_not_every_15_min(
+    service: ReportService, bitrix: FakeBitrix, storage: Storage, clock: Clock
+) -> None:
+    """Нет поля в смарт-процессе — само не пройдёт: ERROR в лог и повтор раз в час."""
+    bitrix.errors = [BitrixError("в смарт-процессе нет полей: «Объёмы»")]
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    assert (await service.flush_outbox()).failed == 1
+
+    clock.now += BACKOFF_MAX_S + 1  # 15 минут — для временных сбоев
+    assert (await service.flush_outbox()).waiting == 1
+    clock.now += PERMANENT_RETRY_S
+    assert (await service.flush_outbox()).sent == 1
+
+
 def test_backoff_grows_and_is_capped() -> None:
     assert [backoff_seconds(n) for n in (1, 2, 3, 4)] == [30, 60, 120, 240]
     assert backoff_seconds(50) == 900
@@ -734,10 +942,63 @@ async def test_correct_today_sets_value_and_journals_prev(
     text = await service.correct_today(USER, 17, 12)
 
     assert sheets.cells[(D, 17)] == 12
-    assert sheets.writes[-1] == (D, {17: 12}, "set")
+    assert sheets.writes[-1] == (D, {17: -3}, "delta")  # только своя доля
     assert "было 15, стало 12 м" in text
     records = await storage.get_writes(USER, D)
     assert [(r.mode, r.qty, r.prev_value) for r in records] == [("add", 15, 0.0), ("set", 12, 15.0)]
+
+
+async def test_correction_keeps_other_masters_volumes(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    await storage.save_draft(1, "a", [ok(17, 10)])
+    await storage.save_draft(2, "b", [ok(17, 5)])
+    await service.confirm(1, D)
+    await service.confirm(2, D)
+
+    text = await service.correct_today(1, 17, 8)
+
+    assert sheets.cells[(D, 17)] == 13  # 8 своих + 5 чужих
+    assert "было 10, стало 8" in text
+    await service.correct_today(1, 17, 0)  # «Очистить» убирает только своё
+    assert sheets.cells[(D, 17)] == 5
+
+
+async def test_correction_refuses_when_cell_was_edited_by_hand(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    sheets.cells[(D, 17)] = 2  # вручную стерли почти всё
+    with pytest.raises(ReportError, match="правили вручную"):
+        await service.correct_today(USER, 17, 0)
+    assert sheets.cells[(D, 17)] == 2
+
+
+async def test_correction_same_value_is_noop(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    text = await service.correct_today(USER, 17, 15)
+    assert text.startswith("Без изменений")
+    assert sheets.calls["write_volumes"] == 1
+
+
+async def test_correction_lost_response_then_retry_does_not_double(
+    service: ReportService, sheets: FakeSheets, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    sheets.lost_responses = [SheetsError("Таблица недоступна.")]
+    with pytest.raises(ReportError):
+        await service.correct_today(USER, 17, 12)
+    assert sheets.cells[(D, 17)] == 12
+
+    await service.correct_today(USER, 17, 12)  # тот же повтор
+
+    assert sheets.cells[(D, 17)] == 12  # не 9
+    assert [(w.mode, w.qty) for w in await storage.get_writes()] == [("add", 15), ("set", 12)]
 
 
 async def test_correction_updates_the_report_item(

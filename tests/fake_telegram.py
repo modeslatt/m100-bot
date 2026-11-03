@@ -11,7 +11,7 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import (
     AnswerCallbackQuery,
     DeleteMessage,
@@ -55,6 +55,8 @@ class FakeSession(BaseSession):
         self.methods: list[TelegramMethod[Any]] = []
         self.alerts: list[tuple[str | None, bool | None]] = []
         self.edit_errors: set[int] = set()  # сообщения, которые нельзя изменить
+        self.answers_expired = False  # «query is too old»: нажатие обрабатывали долго
+        self.network_errors: list[str] = []  # имена методов, которые упадут с сетью
         self.file_bytes = b"OggS fake voice"  # содержимое любого скачиваемого файла
         self._next_id = 1000
 
@@ -66,6 +68,9 @@ class FakeSession(BaseSession):
 
     async def make_request(self, bot: Bot, method: TelegramMethod[Any], timeout: int | None = None):
         self.methods.append(method)
+        if type(method).__name__ in self.network_errors:
+            self.network_errors.remove(type(method).__name__)
+            raise TelegramNetworkError(method=method, message="Request timeout error")
         if isinstance(method, SendMessage):
             self._next_id += 1
             chat_id = int(method.chat_id)
@@ -98,6 +103,10 @@ class FakeSession(BaseSession):
         if isinstance(method, GetFile):
             return File(file_id=method.file_id, file_unique_id="u", file_path="voice/f.oga")
         if isinstance(method, AnswerCallbackQuery):
+            if self.answers_expired:
+                raise TelegramBadRequest(
+                    method=method, message="Bad Request: query is too old and response timeout"
+                )
             self.alerts.append((method.text, method.show_alert))
             return True
         return True  # SendChatAction, SetMyCommands …

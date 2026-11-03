@@ -14,7 +14,7 @@ import pytest
 from fake_sheets import FakeGspread, make_gspread
 from test_report_service import FakeBitrix, FakeMatcher, ok
 
-from m100bot.services.report import ReportService
+from m100bot.services.report import ReportError, ReportService
 from m100bot.sheets.addressing import col_index
 from m100bot.sheets.catalog import Catalog
 from m100bot.sheets.client import SheetsClient
@@ -124,3 +124,26 @@ async def test_correction_after_confirm_sets_value(
     assert cell(fake, 17, col_index("AX")) == 12
     last = (await storage.get_writes())[-1]
     assert (last.mode, last.qty, last.prev_value) == ("set", 12, 15.0)
+
+
+async def test_inserted_row_is_caught_even_after_catalog_refresh(
+    make_service, fake: FakeGspread, storage: Storage, catalog: Catalog
+) -> None:
+    """Кто-то вставил строку выше 17-й, пока отчёт ждал. Справочник бот уже перечитал
+    (кэш истёк / был вопрос «сколько осталось») — раньше это обнуляло защиту. Сверка идёт
+    с отпечатком позиции в черновике, поэтому запись останавливается."""
+    service = make_service(NEW)
+    pos = catalog.by_row(17)
+    assert pos is not None
+    item = ok(17, 15).model_copy(update={"pos_number": pos.number, "pos_name": pos.norm_name})
+    await storage.save_draft(USER, "медь 6-ка 15 м", [item])
+
+    sheet = fake.spreadsheet.sheets["Лист1"]
+    width = len(sheet.grid[0])
+    sheet.grid.insert(16, ["99", "Новая позиция"] + [None] * (width - 2))
+    await service.sheets.load_catalog(force=True)  # type: ignore[attr-defined]
+
+    with pytest.raises(ReportError, match="сместились"):
+        await service.confirm(USER, NEW)
+    assert await storage.get_writes() == []
+    assert await storage.get_draft(USER) is not None

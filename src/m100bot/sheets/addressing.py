@@ -7,7 +7,7 @@
 
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal
@@ -23,7 +23,11 @@ from m100bot.sheets.catalog import (
 )
 
 VOLUME_LABEL = "объем"  # подпись под каждой датой (строка 4)
-Mode = Literal["add", "set"]
+# add — прибавить объём; set — заменить значение; delta — прибавить разницу (может быть
+# отрицательной: «исправить» меняет только долю мастера в общей ячейке)
+Mode = Literal["add", "set", "delta"]
+# Отпечаток позиции: № из колонки A и нормализованное название — по ним ловим сдвиг строк
+RowId = tuple[int | None, str]
 
 
 # ─────────────── Буквы столбцов и A1-адреса ───────────────
@@ -184,6 +188,14 @@ class CellNotNumericError(ValueError):
         self.row = row
 
 
+class CellBelowZeroError(ValueError):
+    """После вычитания в ячейке получилось бы меньше нуля (ячейку правили вручную)."""
+
+    def __init__(self, row: int, old: float, delta: float) -> None:
+        super().__init__(f"строка {row}: в ячейке {old:g}, вычесть {-delta:g} нельзя")
+        self.row = row
+
+
 @dataclass(frozen=True)
 class CellChange:
     row: int
@@ -217,6 +229,17 @@ def _current_number(row: int, value: Any) -> float:
     return parsed
 
 
+def validate_volumes(volumes: dict[int, float], mode: Mode) -> None:
+    """Аргументы записи корректны (без обращения к таблице), иначе ValueError."""
+    if mode not in ("add", "set", "delta"):
+        raise ValueError(f"mode должен быть 'add', 'set' или 'delta', получено {mode!r}")
+    for row, qty in volumes.items():
+        if isinstance(qty, bool) or not isinstance(qty, int | float):
+            raise ValueError(f"строка {row}: объём должен быть числом, получено {qty!r}")
+        if not math.isfinite(qty) or (qty < 0 and mode != "delta"):
+            raise ValueError(f"строка {row}: недопустимый объём {qty!r}")
+
+
 def compute_changes(
     current: dict[int, Any], volumes: dict[int, float], mode: Mode = "add"
 ) -> list[CellChange]:
@@ -224,20 +247,19 @@ def compute_changes(
 
     add — прибавить к текущему значению (пустая ячейка = 0); нулевой объём пропускаем.
     set — заменить значение. Объём должен быть конечным числом ≥ 0.
+    delta — прибавить разницу, она может быть отрицательной; ноль пропускаем; результат
+    меньше нуля → CellBelowZeroError.
     """
-    if mode not in ("add", "set"):
-        raise ValueError(f"mode должен быть 'add' или 'set', получено {mode!r}")
+    validate_volumes(volumes, mode)
     changes: list[CellChange] = []
     for row, qty in sorted(volumes.items()):
-        if isinstance(qty, bool) or not isinstance(qty, int | float):
-            raise ValueError(f"строка {row}: объём должен быть числом, получено {qty!r}")
-        if not math.isfinite(qty) or qty < 0:
-            raise ValueError(f"строка {row}: недопустимый объём {qty!r}")
-        if mode == "add" and qty == 0:
+        if mode in ("add", "delta") and qty == 0:
             continue
         old = _current_number(row, current.get(row))
-        new = old + qty if mode == "add" else float(qty)
-        changes.append(CellChange(row, old, round(new, 6)))
+        new = round(old + qty if mode != "set" else float(qty), 6)
+        if new < 0:
+            raise CellBelowZeroError(row, old, qty)
+        changes.append(CellChange(row, old, new))
     return changes
 
 
@@ -248,21 +270,31 @@ def sheet_value(value: float) -> int | float | str:
     return int(value) if float(value).is_integer() else value
 
 
-def find_shifted_rows(positions: Iterable[Position], ab: dict[int, tuple[Any, Any]]) -> list[int]:
-    """Строки, где № (колонка A) или название (B) в таблице уже не те, что в справочнике.
+def row_id(pos: Position) -> RowId:
+    return (pos.number, pos.norm_name)
 
-    Так ловим ситуацию «кто-то вставил или удалил строку, пока отчёт ждал подтверждения»:
-    объём иначе тихо ушёл бы в соседнюю позицию.
+
+def find_shifted_rows(expected: Mapping[int, RowId], ab: dict[int, tuple[Any, Any]]) -> list[int]:
+    """Строки, где № (колонка A) или название (B) в таблице уже не те, что ожидаются.
+
+    Ожидание — отпечаток позиции, запомненный, когда мастер её увидел (`row_id`). Так ловим
+    «кто-то вставил или удалил строку, пока отчёт ждал подтверждения»: объём иначе тихо
+    ушёл бы в соседнюю позицию.
     """
     bad: list[int] = []
-    for p in positions:
-        num_cell, name_cell = ab.get(p.row, (None, None))
-        same_name = isinstance(name_cell, str) and normalize_text(name_cell) == p.norm_name
+    for row, (number, norm_name) in sorted(expected.items()):
+        num_cell, name_cell = ab.get(row, (None, None))
+        same_name = isinstance(name_cell, str) and normalize_text(name_cell) == norm_name
         num = parse_number(num_cell)
-        same_num = num == (float(p.number) if p.number is not None else None)
+        same_num = num == (float(number) if number is not None else None)
         if not (same_name and same_num):
-            bad.append(p.row)
+            bad.append(row)
     return bad
+
+
+def cell_numbers(current: Mapping[int, Any], rows: Iterable[int]) -> dict[int, float]:
+    """Числа в ячейках (пустая = 0); текст в ячейке → CellNotNumericError."""
+    return {r: _current_number(r, current.get(r)) for r in rows}
 
 
 # ─────────────── Лист «Синонимы» ───────────────

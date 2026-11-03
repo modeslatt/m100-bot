@@ -6,7 +6,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher
 from fake_telegram import Chat, FakeSession
 from test_report_service import FakeBitrix, FakeMatcher, FakeSheets, ok
 
+from m100bot.bot import render
 from m100bot.bot.app import build_dispatcher
 from m100bot.matching.llm import LlmError
 from m100bot.matching.models import MatchedItem, MatchStatus
@@ -204,7 +205,8 @@ async def test_sheets_failure_keeps_card_and_retry_works(env: Env) -> None:
 
     assert env.chat.find("⚠️").text == (
         "⚠️ Таблица недоступна. Попробуйте позже. "
-        "Отчёт сохранён — нажмите «Записать» ещё раз чуть позже."
+        "Отчёт сохранён — нажмите «Записать» ещё раз чуть позже: бот проверит таблицу "
+        "и не удвоит объём."
     )
     assert card.text.startswith("Отчёт за") and "✅ Записать" in card.labels  # карточка цела
     assert await env.storage.get_draft(1) is not None
@@ -570,6 +572,91 @@ async def test_today_back_button(env: Env) -> None:
     await env.chat.press(today.id, "✏️ Исправить")
     await env.chat.press(today.id, "Назад")
     assert today.text.startswith("Сегодня, 02.11.2026, записано:")
+
+
+async def test_yesterdays_today_buttons_do_nothing(env: Env) -> None:
+    """Список /today открыли вчера, «Очистить» нажали сегодня — сегодняшний день не трогаем."""
+    card = await report(env, ok(17, 15))
+    await env.chat.press(card.id, "✅ Записать")
+    await env.chat.say("/today")
+    today = env.chat.find("Сегодня")
+    await env.chat.press(today.id, "✏️ Исправить")
+    await env.chat.press(today.id, "1")
+
+    env.service._today = lambda: D + timedelta(days=1)  # type: ignore[method-assign]
+    await env.chat.press(today.id, "Очистить")
+
+    assert env.session.alerts[-1] == (
+        "Этот список — за прошлый день. Откройте /today заново.",
+        True,
+    )
+    assert env.sheets.cells[(D, 17)] == 15
+    assert len(await env.storage.get_writes()) == 1
+
+
+async def test_correction_typed_after_midnight_is_refused(env: Env) -> None:
+    card = await report(env, ok(17, 15))
+    await env.chat.press(card.id, "✅ Записать")
+    await env.chat.say("/today")
+    today = env.chat.find("Сегодня")
+    await env.chat.press(today.id, "✏️ Исправить")
+    await env.chat.press(today.id, "1")
+
+    env.service._today = lambda: D + timedelta(days=1)  # type: ignore[method-assign]
+    await env.chat.say("12")
+
+    assert env.chat.find("Этот список").text.startswith("Этот список — за прошлый день")
+    assert env.sheets.writes[-1][2] == "add"  # исправления не было
+
+
+async def test_report_confirmed_after_midnight_goes_to_its_day(env: Env) -> None:
+    """Отчёт прислан 02.11, «Записать» нажато 03.11 — объёмы за 02.11, как на карточке."""
+    card = await report(env, ok(17, 15))
+    env.service._today = lambda: D + timedelta(days=1)  # type: ignore[method-assign]
+
+    await env.chat.press(card.id, "✅ Записать")
+
+    assert card.text.startswith("✅ Записано в таблицу за 02.11.2026:")
+    assert env.sheets.cells == {(D, 17): 15}
+
+
+async def test_error_reaches_master_even_if_callback_expired(env: Env) -> None:
+    """Запись шла долго (повторы Sheets), срок ответа на нажатие истёк — текст ошибки
+    всё равно доходит до мастера."""
+    env.sheets.write_errors = [SheetsError("Таблица недоступна.")]
+    env.session.answers_expired = True
+    card = await report(env, ok(17, 15))
+
+    await env.chat.press(card.id, "✅ Записать")
+
+    assert env.chat.find("⚠️ Таблица недоступна.").text.endswith("не удвоит объём.")
+
+
+async def test_written_report_survives_telegram_failure(env: Env) -> None:
+    """Отчёт записан, а обновить карточку не вышло (сеть) — итог приходит новым сообщением,
+    а не «что-то пошло не так» (иначе мастер прислал бы отчёт заново)."""
+    card = await report(env, ok(17, 15))
+    env.session.network_errors = ["EditMessageText"]
+
+    await env.chat.press(card.id, "✅ Записать")
+
+    assert env.chat.find("✅ Записано в таблицу").text.startswith("✅ Записано в таблицу за")
+    assert render.FAILED not in [a for a, _ in env.session.alerts]
+    assert env.sheets.cells[(D, 17)] == 15
+
+
+async def test_more_messages_while_asking_about_yesterday_are_kept(env: Env) -> None:
+    """Бот спросил про вчерашний отчёт, а мастер прислал ещё сообщение — оба текста
+    попадут в отчёт, ни один не теряется."""
+    await env.storage.save_draft(1, "вчера", [ok(17, 15)], work_date=D - timedelta(days=1))
+    env.matcher.items = [ok(55, 5)]
+    await env.chat.say("кабель 5 м")
+    await env.chat.say("и ещё хомуты")
+    question = env.chat.find("Есть незаписанный отчёт")
+
+    await env.chat.press(question.id, "🆕 Новый отчёт")
+
+    assert env.matcher.seen[-1][0] == "кабель 5 м\nи ещё хомуты"
 
 
 # ─────────────── Команды и прочее ───────────────

@@ -10,6 +10,11 @@
   Недоступный Битрикс не мешает мастеру закончить отчёт. Каждый подтверждённый отчёт —
   свой элемент CRM; исправление меняет элементы тех отчётов, где была позиция;
 - каждая запись попадает в журнал `writes` с prev_value — значением ячейки до записи;
+- перед записью в таблицу в SQLite кладётся «намерение» (что и куда пишем): если ответ
+  Sheets потерялся или журнал не сохранился, повторное нажатие проверяет таблицу
+  (`resume_write`) и не удваивает объём; пока намерение не закрыто, черновик не меняется;
+- перед записью № и название строки сверяются с отпечатком, который видел мастер;
+- «Исправить» меняет только долю мастера в общей ячейке (разница к его итогу);
 - кнопки карточки несут отпечаток черновика (`Draft.token`): нажатие на старую карточку
   не должно ничего записать, поэтому правящие методы принимают `token` и сверяют его
   под блокировкой мастера.
@@ -20,7 +25,7 @@ import math
 import re
 import time
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Protocol
@@ -28,22 +33,37 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from m100bot.bitrix.client import BitrixError, BitrixUnavailable
 from m100bot.matching.llm import LlmError
 from m100bot.matching.matcher import resolve_position
 from m100bot.matching.models import MatchedItem, MatchStatus, Understood
-from m100bot.sheets.addressing import CellChange, Mode
+from m100bot.sheets.addressing import CellBelowZeroError, CellChange, Mode, RowId
 from m100bot.sheets.catalog import Catalog, Position
-from m100bot.sheets.client import SheetChangedError, SheetsError
-from m100bot.storage.db import Draft, NewWrite, OutboxItem, Report, Storage, fold_writes
+from m100bot.sheets.client import SheetChangedError, SheetsError, WriteConflictError
+from m100bot.storage.db import (
+    Draft,
+    NewWrite,
+    OutboxItem,
+    PendingWrite,
+    Report,
+    Storage,
+    fold_writes,
+)
 
 BACKOFF_BASE_S = 30.0  # пауза перед второй попыткой отправки в Битрикс
 BACKOFF_MAX_S = 900.0  # дальше — раз в 15 минут, пока не получится
+# Ошибка настройки Битрикса (нет поля, нет прав, неверный вебхук) сама не пройдёт:
+# повторяем раз в час и громко пишем в лог, что нужно исправить
+PERMANENT_RETRY_S = 3600.0
 # Общий предел на распознавание одного сообщения: повторы LLM и переспрос модели вместе
 # иначе могли бы держать мастера на «Разбираю отчёт…» до 8 минут
 RECOGNIZE_BUDGET_S = 180.0
 
 NO_DRAFT = "Нет отчёта для записи. Пришлите сообщение с работами."
 STALE = "Эта карточка устарела. Пришлите отчёт заново."
+SHIFTED = (
+    "⚠️ Таблицу изменили, пока отчёт ждал подтверждения: строки сместились. Отправьте отчёт заново."
+)
 
 
 class ReportError(RuntimeError):
@@ -59,7 +79,16 @@ class SheetsLike(Protocol):
     async def load_synonyms(self) -> dict[str, int]: ...
     async def read_done(self, rows: Iterable[int]) -> dict[int, float]: ...
     async def write_volumes(
-        self, d: date, volumes: dict[int, float], *, mode: Mode = "add"
+        self,
+        d: date,
+        volumes: dict[int, float],
+        *,
+        mode: Mode = "add",
+        expected: Mapping[int, RowId] | None = None,
+        before_write: Callable[[list[CellChange]], Awaitable[None]] | None = None,
+    ) -> list[CellChange]: ...
+    async def resume_write(
+        self, d: date, changes: list[CellChange], *, expected: Mapping[int, RowId] | None = None
     ) -> list[CellChange]: ...
     def row_link(self, row: int) -> str: ...
 
@@ -194,10 +223,14 @@ class ReportService:
         return self._today()
 
     def draft_day(self, draft: Draft) -> date:
-        """День, когда черновик последний раз меняли (по часовому поясу объекта).
+        """День отчёта: когда пришло первое сообщение (по часовому поясу объекта).
 
-        Новое сообщение дописывается в сегодняшний черновик; про вчерашний бот спрашивает.
+        В этот день и пишем: отчёт от 23:40, подтверждённый в 00:05, — за вчера. Новое
+        сообщение дописывается в сегодняшний черновик; про вчерашний бот спрашивает.
+        Черновик старой версии без даты — день последнего изменения.
         """
+        if draft.work_date is not None:
+            return draft.work_date
         return datetime.fromisoformat(draft.updated_at).astimezone(self._tz).date()
 
     async def catalog(self) -> Catalog:
@@ -218,19 +251,23 @@ class ReportService:
     # ─────────────── Распознавание ───────────────
 
     async def recognize(
-        self, user_id: int, text: str, *, append: bool = False, token: str | None = None
+        self, user_id: int, text: str, *, append: bool | None = False, token: str | None = None
     ) -> Understood:
         """Сообщение мастера → отчёт или вопрос об остатке.
 
         Отчёт: позиции сохраняются в черновик — новый (прежний заменяется) или, при append,
         дописываются в конец текущего (token — проверка, что карточка не устарела).
+        append=None — решить под блокировкой мастера: есть черновик — дописать. Так два
+        сообщения подряд не затирают друг друга (решение «до блокировки» устаревает).
         Вопрос: черновик не трогаем, позиции нужны только для ответа.
         Пустой отчёт черновик не трогает. Ошибки справочника (`SheetsError`) и
         LLM (`LlmError`) пробрасываются: их тексты уже понятны мастеру.
         """
         async with self._user_locks[user_id]:
             draft = None
-            if append:
+            if append is None:
+                draft = await self.storage.get_draft(user_id)
+            elif append:
                 draft = (
                     await self._load(user_id, token)
                     if token
@@ -239,9 +276,12 @@ class ReportService:
             understood = await self._understand(text)
             if understood.intent == "question" or not understood.items:
                 return understood
+            await self._no_pending(user_id)
             items = (draft.items if draft else []) + understood.items
             source = f"{draft.source_text}\n{text}" if draft else text
-            await self.storage.save_draft(user_id, source, items)
+            await self.storage.save_draft(
+                user_id, source, items, work_date=None if draft else self._today()
+            )
             return understood
 
     async def _understand(self, text: str) -> Understood:
@@ -380,6 +420,7 @@ class ReportService:
         async with self._user_locks[user_id]:
             draft = await self._load(user_id, token)
             self._item(draft, idx)
+            await self._no_pending(user_id)
             items = [i for n, i in enumerate(draft.items) if n != idx]
             if not items:
                 await self.storage.delete_draft(user_id)
@@ -388,10 +429,16 @@ class ReportService:
             return await self.storage.get_draft(user_id)
 
     async def cancel(self, user_id: int) -> None:
+        """Удалить черновик. Незакрытое намерение записи тоже снимается: мастер сам
+        отказался от отчёта (в журнале останется только то, что дошло до журнала)."""
         async with self._user_locks[user_id]:
+            if await self.storage.get_pending(user_id) is not None:
+                logger.warning("Мастер {} удалил отчёт с прерванной записью", user_id)
+                await self.storage.clear_pending(user_id)
             await self.storage.delete_draft(user_id)
 
     async def _save(self, user_id: int, draft: Draft, idx: int, new: MatchedItem) -> Draft:
+        await self._no_pending(user_id)
         items = list(draft.items)
         items[idx] = new
         await self.storage.save_draft(user_id, draft.source_text, items)
@@ -404,19 +451,21 @@ class ReportService:
     async def confirm(
         self,
         user_id: int,
-        work_date: date,
+        work_date: date | None = None,
         *,
         master: str | None = None,
         token: str | None = None,
     ) -> str:
         """Записать подтверждённые позиции (status=OK) в таблицу, журнал и outbox Битрикса.
 
+        work_date=None — день отчёта (`draft_day`), а не день нажатия кнопки.
         Возвращает текст итога. Не записалось — `ReportError` с текстом для мастера,
         черновик цел. Неразобранные позиции остаются в черновике; «нет в смете» не
         блокирует запись и в черновике не остаётся (в итоге о них сказано один раз).
         """
         async with self._user_locks[user_id]:
             draft = await self._load(user_id, token)
+            work_date = work_date or self.draft_day(draft)
             ready = [i for i in draft.items if i.is_ready]
             skipped = [i for i in draft.items if i.status == MatchStatus.NOT_FOUND]
             leftover = [
@@ -436,10 +485,20 @@ class ReportService:
 
             # справочник — до записи: после неё остаются только локальные операции
             catalog = await self._catalog()
-            changes = {
-                c.row: c
-                for c in await self._write_sheet(work_date, volumes, "add", retry="Записать")
+            expected = {
+                i.row: (i.pos_number, i.pos_name)
+                for i in ready
+                if i.row is not None and i.pos_name is not None
             }
+            key = f"report:{draft.token}"
+            pending = await self._pending_for(user_id, key, work_date)
+            if pending is not None:
+                written = await self._resume_sheet(user_id, pending, expected, retry="Записать")
+            else:
+                written = await self._write_sheet(
+                    user_id, key, work_date, volumes, "add", expected=expected, retry="Записать"
+                )
+            changes = {c.row: c for c in written}
             writes = [
                 NewWrite(row, qty, "add", changes[row].old if row in changes else None)
                 for row, qty in sorted(volumes.items())
@@ -470,8 +529,10 @@ class ReportService:
     async def correct_today(
         self, user_id: int, row: int, qty: float, *, master: str | None = None
     ) -> str:
-        """Заменить (set) сегодняшнее значение строки; в журнал — с prev_value.
+        """Новый итог мастера за сегодня по строке (0 — очистить свою часть).
 
+        Ячейка общая для всех мастеров, поэтому меняем только долю этого мастера: пишем
+        разницу между новым итогом и его итогом по журналу. Чужие объёмы остаются.
         Возвращает текст итога; не получилось — `ReportError`.
         """
         if isinstance(qty, bool) or not math.isfinite(qty) or qty < 0:
@@ -482,7 +543,18 @@ class ReportService:
             if pos is None:
                 raise ReportError("Эта строка не является позицией сметы.")
             today = self._today()
-            changes = await self._write_sheet(today, {row: qty}, "set", retry="Исправить")
+            mine = fold_writes(await self.storage.get_writes(user_id, today)).get(row, 0.0)
+            key = f"correct:{row}:{qty!r}"
+            pending = await self._pending_for(user_id, key, today)
+            if pending is not None:
+                changes = await self._resume_sheet(user_id, pending, None, retry="Исправить")
+            else:
+                delta = round(qty - mine, 6)
+                if delta == 0:
+                    return f"Без изменений: {pos.short_name} — {fmt_qty(qty)} {pos.unit}."
+                changes = await self._write_sheet(
+                    user_id, key, today, {row: delta}, "delta", expected=None, retry="Исправить"
+                )
             old = next((c.old for c in changes if c.row == row), None)
             await self._journal(
                 user_id,
@@ -495,11 +567,10 @@ class ReportService:
             )
             name = pos.short_name
             if qty == 0:
-                was = f"{fmt_qty(old or 0)} {pos.unit}"
-                return f"✅ Очищено за {today:%d.%m.%Y}: {name} (было {was})"
+                return f"✅ Очищено за {today:%d.%m.%Y}: {name} (было {fmt_qty(mine)} {pos.unit})"
             return (
                 f"✅ Исправлено за {today:%d.%m.%Y}: {name} — "
-                f"было {fmt_qty(old or 0)}, стало {fmt_qty(qty)} {pos.unit}"
+                f"было {fmt_qty(mine)}, стало {fmt_qty(qty)} {pos.unit}"
             )
 
     async def today_report(self, user_id: int) -> tuple[date, list[TodayLine]]:
@@ -521,26 +592,100 @@ class ReportService:
         except SheetsError as e:
             raise ReportError(f"⚠️ {e}") from e
 
+    async def _no_pending(self, user_id: int) -> None:
+        """Пока прерванная запись не закрыта, черновик не меняем: иначе повтор «Записать»
+        не узнает, что уже лежит в таблице."""
+        pending = await self.storage.get_pending(user_id)
+        if pending is not None:
+            raise ReportError(self._pending_text(pending))
+
+    @staticmethod
+    def _pending_text(pending: PendingWrite) -> str:
+        if pending.key.startswith("correct:"):
+            _, row, qty = pending.key.split(":", 2)
+            action = f"повторите исправление строки {row} на {fmt_qty(float(qty))}"
+        else:
+            action = "нажмите «✅ Записать» на карточке отчёта ещё раз"
+        return (
+            "⚠️ Прошлая запись в таблицу прервалась. Чтобы не удвоить объёмы, сначала "
+            f"{action} — бот проверит таблицу. Отказаться от отчёта — «✖️ Отмена» на карточке."
+        )
+
+    async def _pending_for(self, user_id: int, key: str, work_date: date) -> PendingWrite | None:
+        """Незакрытая запись этого же действия (повтор после сбоя) или None.
+        Незакрытая запись другого действия — ReportError: сначала её."""
+        pending = await self.storage.get_pending(user_id)
+        if pending is None:
+            return None
+        if pending.key != key or pending.work_date != work_date:
+            raise ReportError(self._pending_text(pending))
+        return pending
+
     async def _write_sheet(
-        self, work_date: date, volumes: dict[int, float], mode: Mode, *, retry: str
+        self,
+        user_id: int,
+        key: str,
+        work_date: date,
+        volumes: dict[int, float],
+        mode: Mode,
+        *,
+        expected: Mapping[int, RowId] | None,
+        retry: str,
     ) -> list[CellChange]:
-        """Запись в Sheets; любой сбой — ReportError с текстом для мастера."""
+        """Запись в Sheets с «намерением» в SQLite; любой сбой — ReportError для мастера."""
+
+        async def remember(changes: list[CellChange]) -> None:
+            await self.storage.save_pending(user_id, key, work_date, changes)
+
         try:
-            return await self.sheets.write_volumes(work_date, volumes, mode=mode)
+            return await self.sheets.write_volumes(
+                work_date, volumes, mode=mode, expected=expected, before_write=remember
+            )
         except SheetChangedError as e:
-            raise ReportError(
-                "⚠️ Таблицу изменили, пока отчёт ждал подтверждения: строки сместились. "
-                "Отправьте отчёт заново."
-            ) from e
+            raise ReportError(SHIFTED) from e
         except SheetsError as e:
             logger.error("Запись в таблицу не удалась ({}), черновик сохранён", e)
             raise ReportError(
-                f"⚠️ {e} Отчёт сохранён — нажмите «{retry}» ещё раз чуть позже."
+                f"⚠️ {e} Отчёт сохранён — нажмите «{retry}» ещё раз чуть позже: бот проверит "
+                "таблицу и не удвоит объём."
+            ) from e
+        except CellBelowZeroError as e:
+            raise ReportError(
+                f"⚠️ В таблице в строке {e.row} меньше, чем записано вами по журналу бота — "
+                "ячейку правили вручную. Проверьте таблицу, бот ничего не менял."
             ) from e
         except ValueError as e:
             logger.exception("В таблицу ушли некорректные данные: {}", volumes)
             raise ReportError(
                 "⚠️ Не удалось записать: в отчёте некорректные позиции. Отправьте отчёт заново."
+            ) from e
+
+    async def _resume_sheet(
+        self,
+        user_id: int,
+        pending: PendingWrite,
+        expected: Mapping[int, RowId] | None,
+        *,
+        retry: str,
+    ) -> list[CellChange]:
+        """Повтор после прерванной записи: таблица уже «после» — не пишем, «до» — пишем."""
+        try:
+            return await self.sheets.resume_write(
+                pending.work_date, pending.changes, expected=expected
+            )
+        except (SheetChangedError, WriteConflictError) as e:
+            # проверить нельзя — снимаем намерение и отдаём решение мастеру
+            await self.storage.clear_pending(user_id)
+            rows = ", ".join(str(c.row) for c in pending.changes)
+            raise ReportError(
+                f"⚠️ Прошлая запись прервалась, а таблицу с тех пор изменили ({e}). "
+                f"Проверьте строки {rows} за {pending.work_date:%d.%m.%Y}: если объёмы уже "
+                f"там — нажмите «✖️ Отмена», иначе нажмите «{retry}» ещё раз."
+            ) from e
+        except SheetsError as e:
+            raise ReportError(
+                f"⚠️ {e} Нажмите «{retry}» ещё раз чуть позже: бот проверит таблицу и не "
+                "удвоит объём."
             ) from e
 
     # ─────────────── Внутреннее: журнал и Битрикс ───────────────
@@ -558,8 +703,8 @@ class ReportService:
     ) -> None:
         """После успешной записи в таблицу: журнал + outbox + черновик одной транзакцией.
 
-        Если сохранить не удалось — таблица уже изменена, и повторное «Записать» удвоило бы
-        объёмы. Поэтому говорим об этом прямо и просим не повторять.
+        Если сохранить не удалось — таблица уже изменена, но «намерение» записи осталось:
+        повторное нажатие увидит, что объёмы уже в таблице, и только допишет журнал.
         """
         try:
             if leftover is None:
@@ -569,8 +714,8 @@ class ReportService:
         except Exception as e:
             logger.exception("{}, но журнал не сохранён: {}", what, writes)
             raise ReportError(
-                "⚠️ В таблицу записано, но сохранить журнал не удалось. Повторно не нажимайте — "
-                "объёмы удвоятся. Сообщите администратору."
+                "⚠️ В таблицу записано, но журнал бота не сохранился. Нажмите кнопку ещё раз "
+                "чуть позже — бот увидит, что объёмы уже в таблице, и не удвоит их."
             ) from e
         if self.bitrix is not None and self._send_now:
             # Сразу, не дожидаясь фоновой задачи: мастер не ждёт, сбой останется в очереди.
@@ -749,14 +894,24 @@ class ReportService:
                     failed += 1
                     error = _safe_error(e)
                     await self.storage.mark_outbox_failed(item.id, error)
-                    delay = backoff_seconds(item.attempts + 1)
+                    if isinstance(e, BitrixError) and not isinstance(e, BitrixUnavailable):
+                        delay = PERMANENT_RETRY_S
+                        logger.error(
+                            "Битрикс: задание {} не отправлено — ошибка настройки ({}). "
+                            "Проверьте вебхук и поля смарт-процесса (scripts/try_bitrix.py "
+                            "check); повтор через час",
+                            item.id,
+                            error,
+                        )
+                    else:
+                        delay = backoff_seconds(item.attempts + 1)
+                        logger.warning(
+                            "Битрикс: задание {} не отправлено ({}), повтор через {:.0f} с",
+                            item.id,
+                            error,
+                            delay,
+                        )
                     self._next_try[item.id] = now + delay
-                    logger.warning(
-                        "Битрикс: задание {} не отправлено ({}), повтор через {:.0f} с",
-                        item.id,
-                        error,
-                        delay,
-                    )
                 else:
                     sent += 1
                     self._next_try.pop(item.id, None)

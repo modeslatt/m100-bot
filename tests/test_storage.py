@@ -10,7 +10,7 @@ import pytest
 from loguru import logger
 
 from m100bot.matching.models import MatchedItem, MatchStatus
-from m100bot.storage.db import NewWrite, Storage, fold_writes
+from m100bot.storage.db import DraftLostError, NewWrite, Storage, fold_writes
 
 D = date(2026, 11, 2)
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
@@ -93,19 +93,20 @@ async def test_missing_draft_is_none(storage: Storage) -> None:
     assert await storage.get_draft(404) is None
 
 
-async def test_unreadable_draft_is_none_and_kept(storage: Storage) -> None:
-    """Формат MatchedItem мог измениться после обновления: не падаем и не стираем данные."""
+async def test_unreadable_draft_is_reported_once_and_removed(storage: Storage) -> None:
+    """Формат MatchedItem сменился после обновления. Молча вернуть None нельзя — следующее
+    сообщение тихо заменило бы отчёт. Мастер один раз получает понятную ошибку."""
     await storage.save_draft(1, "текст", [item(17, 1)])
     await storage.db.execute("UPDATE drafts SET items_json='[{\"сломано\": true}]'")
     errors: list[str] = []
     sink = logger.add(lambda m: errors.append(m.record["message"]), level="ERROR")
     try:
-        assert await storage.get_draft(1) is None
+        with pytest.raises(DraftLostError, match="Пришлите отчёт заново"):
+            await storage.get_draft(1)
     finally:
         logger.remove(sink)
     assert errors and "не читается" in errors[0]
-    cur = await storage.db.execute("SELECT COUNT(*) AS n FROM drafts")
-    assert (await cur.fetchone())["n"] == 1
+    assert await storage.get_draft(1) is None  # второй раз — просто нет черновика
 
 
 # ─────────────── Журнал ───────────────
@@ -143,6 +144,33 @@ async def test_get_writes_filters_and_orders(storage: Storage) -> None:
 async def test_prev_value_may_be_unknown(storage: Storage) -> None:
     await storage.record_correction(1, D, NewWrite(17, 1, "set", None))
     assert (await storage.get_writes())[0].prev_value is None
+
+
+async def test_old_database_gets_work_date_column(tmp_path: Path) -> None:
+    """База прошлой версии (drafts без work_date) открывается и дописывает колонку."""
+    path = tmp_path / "old.sqlite3"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE drafts (user_id INTEGER PRIMARY KEY, source_text TEXT NOT NULL, "
+        "items_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    con.execute("INSERT INTO drafts VALUES (1, 'старый', '[]', '2026-11-01T10:00:00+00:00')")
+    con.commit()
+    con.close()
+
+    async with Storage(path) as s:
+        old = await s.get_draft(1)
+        assert old is not None and old.work_date is None
+        await s.save_draft(2, "новый", [item(17, 1)], work_date=D)
+        new = await s.get_draft(2)
+        assert new is not None and new.work_date == D
+
+
+async def test_draft_keeps_its_day_on_edits(storage: Storage) -> None:
+    await storage.save_draft(1, "т", [item(17, 1)], work_date=D)
+    await storage.save_draft(1, "т", [item(17, 2)])  # правка — дата прежняя
+    d = await storage.get_draft(1)
+    assert d is not None and d.work_date == D
 
 
 # ─────────────── Транзакции ───────────────

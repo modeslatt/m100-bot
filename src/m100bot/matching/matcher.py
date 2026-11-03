@@ -277,7 +277,15 @@ def resolve_position(item: MatchedItem, pos: Position) -> MatchedItem:
         status = MatchStatus.CLARIFY
     else:
         status = MatchStatus.OK
-    return item.model_copy(update={"row": pos.row, "candidates": [], "status": status})
+    return item.model_copy(
+        update={
+            "row": pos.row,
+            "candidates": [],
+            "status": status,
+            "pos_number": pos.number,
+            "pos_name": pos.norm_name,
+        }
+    )
 
 
 # ─────────────── Ссылки «изоляцию на них столько же» ───────────────
@@ -611,8 +619,12 @@ def _by_previous_diameters(
         picks.append(rows[0])
     if not picks:
         return []
-    status = MatchStatus.OK if item.qty else MatchStatus.CLARIFY
-    return [item.model_copy(update={"status": status, "row": r, "candidates": []}) for r in picks]
+    resolved = []
+    for r in picks:
+        pos = catalog.by_row(r)
+        assert pos is not None
+        resolved.append(resolve_position(item, pos))
+    return resolved
 
 
 def _split(mention: LlmMention) -> list[LlmMention]:

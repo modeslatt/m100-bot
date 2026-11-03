@@ -5,6 +5,7 @@
 Эмодзи на кнопках — как были в заготовке: ✅ ✏️ ➕ ✖️ 📊.
 """
 
+from datetime import date
 from typing import Literal
 
 from aiogram.filters.callback_data import CallbackData
@@ -33,6 +34,7 @@ class Today(CallbackData, prefix="d"):
 
     a: TodayAction
     r: int = 0  # строка таблицы
+    d: int = 0  # день списка (date.toordinal): вчерашние кнопки не правят сегодняшний день
 
 
 def review_keyboard(token: str, n_ready: int, n_unresolved: int) -> InlineKeyboardMarkup:
@@ -106,29 +108,29 @@ def sheet_link_keyboard(url: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def today_keyboard(url: str, has_lines: bool) -> InlineKeyboardMarkup:
+def today_keyboard(url: str, has_lines: bool, day: date) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if has_lines:
-        kb.button(text="✏️ Исправить", callback_data=Today(a="edit"))
+        kb.button(text="✏️ Исправить", callback_data=Today(a="edit", d=day.toordinal()))
     kb.button(text="📊 Открыть таблицу", url=url)
     kb.adjust(2 if has_lines else 1)
     return kb.as_markup()
 
 
-def today_pick_keyboard(lines: list[TodayLine]) -> InlineKeyboardMarkup:
+def today_pick_keyboard(lines: list[TodayLine], day: date) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for n, line in enumerate(lines, start=1):
-        kb.button(text=str(n), callback_data=Today(a="row", r=line.row))
-    kb.button(text="Назад", callback_data=Today(a="back"))
+        kb.button(text=str(n), callback_data=Today(a="row", r=line.row, d=day.toordinal()))
+    kb.button(text="Назад", callback_data=Today(a="back", d=day.toordinal()))
     n = len(lines)
     kb.adjust(*([5] * (n // 5)), *([n % 5] if n % 5 else []), 1)
     return kb.as_markup()
 
 
-def today_item_keyboard(row: int) -> InlineKeyboardMarkup:
+def today_item_keyboard(row: int, day: date) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="Очистить", callback_data=Today(a="clear", r=row))
-    kb.button(text="Назад", callback_data=Today(a="back"))
+    kb.button(text="Очистить", callback_data=Today(a="clear", r=row, d=day.toordinal()))
+    kb.button(text="Назад", callback_data=Today(a="back", d=day.toordinal()))
     kb.adjust(2)
     return kb.as_markup()
 

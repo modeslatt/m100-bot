@@ -11,8 +11,13 @@ from fake_sheets import FakeGspread, make_gspread
 from gspread.exceptions import APIError
 from loguru import logger
 
-from m100bot.sheets.addressing import col_index, date_to_serial
-from m100bot.sheets.client import SheetChangedError, SheetsClient, SheetsError
+from m100bot.sheets.addressing import CellChange, col_index, date_to_serial, row_id
+from m100bot.sheets.client import (
+    SheetChangedError,
+    SheetsClient,
+    SheetsError,
+    WriteConflictError,
+)
 
 NEW_DATE = date(2026, 11, 2)  # после последней даты образца (30.09)
 AX = col_index("AX")  # первый столбец после AW — последней даты образца
@@ -299,6 +304,64 @@ async def test_row_shift_is_detected_and_nothing_is_written(
     with pytest.raises(SheetChangedError, match="сместились"):
         await client.write_volumes(NEW_DATE, {17: 15})
     assert fake.spreadsheet.value_writes == []
+
+
+async def test_row_shift_caught_by_expected_ids_after_catalog_reload(
+    client: SheetsClient, fake: FakeGspread
+) -> None:
+    """Справочник перечитан уже после сдвига — сверка всё равно по отпечатку из черновика."""
+    pos = (await client.load_catalog()).by_row(17)
+    assert pos is not None
+    await client.ensure_date_column(NEW_DATE)
+    ws_of(fake).insert_row(10)
+    await client.load_catalog(force=True)  # эталон в памяти теперь «новый»
+    with pytest.raises(SheetChangedError):
+        await client.write_volumes(NEW_DATE, {17: 15}, expected={17: row_id(pos)})
+    assert fake.spreadsheet.value_writes == []
+
+
+async def test_before_write_sees_changes_before_the_write(
+    client: SheetsClient, fake: FakeGspread
+) -> None:
+    seen: list[tuple[list[CellChange], int]] = []
+
+    async def remember(changes: list[CellChange]) -> None:
+        seen.append((changes, len(fake.spreadsheet.value_writes)))
+
+    await client.write_volumes(NEW_DATE, {17: 15}, before_write=remember)
+    [(changes, writes_so_far)] = seen
+    assert [(c.row, c.old, c.new) for c in changes] == [(17, 0, 15)]
+    assert writes_so_far == 0  # намерение сохраняется ДО записи
+
+
+async def test_delta_changes_only_the_difference(client: SheetsClient, fake: FakeGspread) -> None:
+    await client.write_volumes(NEW_DATE, {17: 15})
+    [change] = await client.write_volumes(NEW_DATE, {17: -5}, mode="delta")
+    assert (change.old, change.new) == (15, 10)
+    assert ws_of(fake).get_cell(17, AX) == 10
+
+
+async def test_resume_when_already_written_writes_nothing(
+    client: SheetsClient, fake: FakeGspread
+) -> None:
+    changes = await client.write_volumes(NEW_DATE, {17: 15})
+    writes = len(fake.spreadsheet.value_writes)
+    assert await client.resume_write(NEW_DATE, changes) == changes
+    assert len(fake.spreadsheet.value_writes) == writes
+    assert ws_of(fake).get_cell(17, AX) == 15
+
+
+async def test_resume_when_not_written_writes(client: SheetsClient, fake: FakeGspread) -> None:
+    await client.resume_write(NEW_DATE, [CellChange(17, 0.0, 15.0)])
+    assert ws_of(fake).get_cell(17, AX) == 15
+
+
+async def test_resume_conflict_touches_nothing(client: SheetsClient, fake: FakeGspread) -> None:
+    await client.write_volumes(NEW_DATE, {17: 7})  # в ячейке ни «до» (0), ни «после» (15)
+    writes = len(fake.spreadsheet.value_writes)
+    with pytest.raises(WriteConflictError):
+        await client.resume_write(NEW_DATE, [CellChange(17, 0.0, 15.0)])
+    assert len(fake.spreadsheet.value_writes) == writes
 
 
 # ─────────────── Ошибки Google ───────────────

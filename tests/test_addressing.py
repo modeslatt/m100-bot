@@ -1,13 +1,16 @@
 """Адреса, формулы и запросы к таблице — чистые функции, без сети."""
 
 import math
+from collections.abc import Iterable
 from datetime import date
 from typing import Any
 
 import pytest
 
 from m100bot.sheets.addressing import (
+    CellBelowZeroError,
     CellNotNumericError,
+    RowId,
     build_row_link,
     cell,
     col_index,
@@ -23,10 +26,11 @@ from m100bot.sheets.addressing import (
     insert_date_column_requests,
     parse_synonyms,
     plan_date_column,
+    row_id,
     sheet_value,
     two_column_values,
 )
-from m100bot.sheets.catalog import Catalog, parse_date_columns
+from m100bot.sheets.catalog import Catalog, Position, parse_date_columns
 
 # ─────────────── Буквы столбцов ───────────────
 
@@ -242,6 +246,10 @@ def test_column_values_handles_trimmed_tail() -> None:
 # ─────────────── Сдвиг строк ───────────────
 
 
+def _ids(positions: Iterable[Position | None]) -> dict[int, RowId]:
+    return {p.row: row_id(p) for p in positions if p is not None}
+
+
 def _ab(sample_rows: list[list[Any]], first: int, last: int) -> dict[int, tuple[Any, Any]]:
     return two_column_values(first, [r[:2] for r in sample_rows[first - 1 : last]])
 
@@ -250,14 +258,24 @@ def test_no_shift_when_sheet_matches_catalog(
     catalog: Catalog, sample_rows: list[list[Any]]
 ) -> None:
     ab = _ab(sample_rows, 5, 71)
-    assert find_shifted_rows(catalog.positions, ab) == []
+    assert find_shifted_rows(_ids(catalog.positions), ab) == []
+
+
+def test_delta_mode_adds_signed_difference() -> None:
+    [change] = compute_changes({17: 15}, {17: -5}, "delta")
+    assert (change.old, change.new) == (15, 10)
+    assert compute_changes({17: 15}, {17: 0}, "delta") == []  # нет разницы — нечего писать
+    with pytest.raises(CellBelowZeroError):
+        compute_changes({17: 3}, {17: -5}, "delta")  # ячейку правили вручную
+    with pytest.raises(ValueError, match="недопустимый"):
+        compute_changes({17: 15}, {17: -5}, "add")  # в add минус по-прежнему ошибка
 
 
 def test_shift_detected_when_row_inserted(catalog: Catalog, sample_rows: list[list[Any]]) -> None:
     """Вставили строку выше 17-й: теперь в 17-й стоит то, что раньше было в 16-й."""
     shifted = sample_rows[:16] + [["x", "Новая работа"]] + sample_rows[16:]
     ab = _ab(shifted, 17, 19)
-    assert find_shifted_rows([p for p in catalog.positions if p.row in (17, 18, 19)], ab) == [
+    assert find_shifted_rows(_ids(p for p in catalog.positions if p.row in (17, 18, 19)), ab) == [
         17,
         18,
         19,
@@ -268,12 +286,15 @@ def test_shift_detected_by_number_alone(catalog: Catalog, sample_rows: list[list
     """У строк 48 и 49 одинаковые названия — различает их только № в колонке A."""
     ab = _ab(sample_rows, 48, 49)
     ab[48], ab[49] = ab[49], ab[48]  # поменяли местами
-    assert find_shifted_rows([p for p in catalog.positions if p.row in (48, 49)], ab) == [48, 49]
+    assert find_shifted_rows(_ids(p for p in catalog.positions if p.row in (48, 49)), ab) == [
+        48,
+        49,
+    ]
 
 
 def test_row_without_number_is_not_a_shift(catalog: Catalog, sample_rows: list[list[Any]]) -> None:
     """Строка 71 в образце без № в колонке A — это норма, а не сдвиг."""
-    assert find_shifted_rows([catalog.by_row(71)], _ab(sample_rows, 71, 71)) == []  # type: ignore[list-item]
+    assert find_shifted_rows(_ids([catalog.by_row(71)]), _ab(sample_rows, 71, 71)) == []
 
 
 # ─────────────── Синонимы ───────────────

@@ -6,6 +6,7 @@
 """
 
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,11 +42,11 @@ from m100bot.matching.llm import LlmError
 from m100bot.matching.models import MatchedItem
 from m100bot.services.report import ReportError, ReportService, StaleCardError
 from m100bot.sheets.client import SheetsError
-from m100bot.storage.db import Draft
+from m100bot.storage.db import Draft, DraftLostError
 from m100bot.voice.transcribe import TranscribeError, Transcriber
 
 # Ошибки, тексты которых уже написаны для мастера
-USER_ERRORS = (ReportError, SheetsError, LlmError)
+USER_ERRORS = (ReportError, SheetsError, LlmError, DraftLostError)
 
 
 # ─────────────── Telegram-мелочи ───────────────
@@ -110,7 +111,7 @@ async def show_card(
         return None
     catalog = await service.catalog()
     ready, unresolved = render.card_counts(draft.items)
-    text = render.card_text(draft.items, service.today(), catalog)
+    text = render.card_text(draft.items, service.draft_day(draft), catalog)
     card_id = await edit_or_send(
         bot, chat_id, edit_id, text, review_keyboard(draft.token, ready, unresolved)
     )
@@ -176,7 +177,11 @@ async def show_today(
     work_date, lines = await service.today_report(user_id)
     url = service.table_link(lines[0].row if lines else None)
     await edit_or_send(
-        bot, chat_id, edit_id, render.today_text(work_date, lines), today_keyboard(url, bool(lines))
+        bot,
+        chat_id,
+        edit_id,
+        render.today_text(work_date, lines),
+        today_keyboard(url, bool(lines), work_date),
     )
 
 
@@ -239,8 +244,10 @@ async def process_report(
         await ask_about_stale_draft(message, text, state, service, draft)
         return
     placeholder = await message.answer(render.THINKING)
+    # append=None: «дописать или новый» решает сервис под блокировкой мастера — второе
+    # сообщение, пришедшее во время распознавания первого, допишется, а не затрёт его
     await recognize_into_card(
-        bot, chat_id, service, state, uid, text, placeholder.message_id, append=draft is not None
+        bot, chat_id, service, state, uid, text, placeholder.message_id, append=None
     )
 
 
@@ -253,7 +260,7 @@ async def recognize_into_card(
     text: str,
     placeholder_id: int,
     *,
-    append: bool,
+    append: bool | None,
     token: str | None = None,
 ) -> None:
     """Распознать текст (дописать в черновик или начать новый) и показать карточку на месте
@@ -298,7 +305,9 @@ async def ask_about_stale_draft(
         word=render.plural(n, ("позиция", "позиции", "позиций")),
     )
     await state.set_state(None)
-    await state.update_data(pending_text=text)
+    earlier = (await state.get_data()).get("pending_text")
+    # мастер прислал ещё сообщение, пока бот ждёт ответа про вчерашний отчёт — копим, не теряем
+    await state.update_data(pending_text=f"{earlier}\n{text}" if earlier else text)
     await message.answer(question, reply_markup=stale_draft_keyboard(draft.token))
 
 
@@ -430,6 +439,10 @@ async def correct_today_qty(
     if qty is None:
         return
     data = await state.get_data()
+    if data.get("day") != service.today().toordinal():  # выбрали строку вчера, ответили сегодня
+        await state.clear()
+        await message.answer(render.TODAY_STALE)
+        return
     try:
         result = await service.correct_today(
             uid, data.get("row", 0), qty, master=message.from_user.full_name
@@ -549,13 +562,20 @@ async def card_ok(t: Tap, cb: Act) -> None:
     draft = await t.service.get_draft(t.uid, token=cb.t)
     assert draft is not None
     rows = sorted({i.row for i in draft.items if i.is_ready and i.row is not None})
-    summary = await t.service.confirm(t.uid, t.service.today(), master=t.master, token=cb.t)
-    link = t.service.table_link(rows[0] if rows else None)
-    await edit_or_send(t.bot, t.chat_id, t.msg_id, summary, sheet_link_keyboard(link))
-    await delete_quietly(t.bot, t.chat_id, t.data.get("question_id"))
-    await t.state.clear()
-    if await t.service.get_draft(t.uid) is not None:  # остались позиции, требующие ответа
-        await t.refresh(card_id=None)
+    summary = await t.service.confirm(t.uid, master=t.master, token=cb.t)  # в день отчёта
+    # Дальше только интерфейс. Отчёт уже записан: сбой Telegram здесь не должен выглядеть
+    # как «что-то пошло не так» — мастер прислал бы отчёт заново и удвоил объёмы.
+    try:
+        link = t.service.table_link(rows[0] if rows else None)
+        await edit_or_send(t.bot, t.chat_id, t.msg_id, summary, sheet_link_keyboard(link))
+        await delete_quietly(t.bot, t.chat_id, t.data.get("question_id"))
+        await t.state.clear()
+        if await t.service.get_draft(t.uid) is not None:  # остались позиции для ответа
+            await t.refresh(card_id=None)
+    except Exception:
+        logger.exception("Отчёт записан, но карточку обновить не удалось")
+        with suppress(Exception):
+            await t.bot.send_message(t.chat_id, summary)
 
 
 async def card_edit(t: Tap, cb: Act) -> None:
@@ -683,7 +703,9 @@ async def today_edit(t: Tap, cb: Today) -> None:
     if not lines:
         await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
         return
-    await edit_or_send(t.bot, t.chat_id, t.msg_id, render.EDIT_PICK, today_pick_keyboard(lines))
+    await edit_or_send(
+        t.bot, t.chat_id, t.msg_id, render.EDIT_PICK, today_pick_keyboard(lines, t.service.today())
+    )
 
 
 async def today_row(t: Tap, cb: Today) -> None:
@@ -695,12 +717,18 @@ async def today_row(t: Tap, cb: Today) -> None:
         await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
         return
     await t.state.set_state(ReportFlow.correcting_today)
-    await t.state.update_data(row=cb.r, today_msg=t.msg_id)
-    text, keyboard = render.today_item_text(line), today_item_keyboard(cb.r)
+    day = t.service.today()
+    await t.state.update_data(row=cb.r, today_msg=t.msg_id, day=day.toordinal())
+    text, keyboard = render.today_item_text(line), today_item_keyboard(cb.r, day)
     await edit_or_send(t.bot, t.chat_id, t.msg_id, text, keyboard)
 
 
 async def today_clear(t: Tap, cb: Today) -> None:
+    _, lines = await t.service.today_report(t.uid)
+    if not any(ln.row == cb.r for ln in lines):  # сегодня эту строку мастер не писал
+        await t.state.clear()
+        await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
+        return
     result = await t.service.correct_today(t.uid, cb.r, 0, master=t.master)
     await t.state.clear()
     await show_today(t.bot, t.chat_id, t.service, t.uid, edit_id=t.msg_id)
@@ -720,25 +748,41 @@ TODAY_ACTIONS: dict[TodayAction, Callable[[Tap, Today], Awaitable[None]]] = {
 }
 
 
+async def answer_quietly(call: CallbackQuery, text: str | None = None, **kw: Any) -> bool:
+    """Ответить на нажатие. Долгая запись (повторы Sheets) переживает срок жизни callback —
+    тогда Telegram отвечает «query is too old»; это не должно помешать сообщению мастеру."""
+    try:
+        await call.answer(text, **kw)
+        return True
+    except TelegramBadRequest as e:
+        logger.debug("Ответ на нажатие не принят: {}", e)
+        return False
+
+
 async def guarded(call: CallbackQuery, bot: Bot, action: Callable[[], Awaitable[None]]) -> None:
-    """Выполнить действие кнопки; любую ошибку превратить в понятное сообщение."""
+    """Выполнить действие кнопки; любую ошибку превратить в понятное сообщение.
+
+    Сначала сообщение мастеру, потом ответ на нажатие: ответ может уже не пройти.
+    """
     if call.message is None:
-        await call.answer()
+        await answer_quietly(call)
         return
     chat_id = call.message.chat.id
     try:
         await action()
     except StaleCardError as e:
-        await call.answer(str(e), show_alert=True)
+        if not await answer_quietly(call, str(e), show_alert=True):
+            await bot.send_message(chat_id, str(e))
         await strip_keyboard(bot, chat_id, call.message.message_id)
         return
     except USER_ERRORS as e:
-        await call.answer()
         await bot.send_message(chat_id, str(e))
+        await answer_quietly(call)
         return
     except Exception:
         logger.exception("Ошибка при обработке кнопки")
-        await call.answer(render.FAILED, show_alert=True)
+        if not await answer_quietly(call, render.FAILED, show_alert=True):
+            await bot.send_message(chat_id, render.FAILED)
         return
     await call.answer()
 
@@ -757,6 +801,9 @@ async def on_today_act(
     call: CallbackQuery, callback_data: Today, state: FSMContext, bot: Bot, service: ReportService
 ) -> None:
     async def run() -> None:
+        if callback_data.d != service.today().toordinal():  # список за прошлый день
+            await state.clear()
+            raise StaleCardError(render.TODAY_STALE)
         tap = await make_tap(call, state, bot, service)
         await TODAY_ACTIONS[callback_data.a](tap, callback_data)
 

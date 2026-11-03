@@ -22,13 +22,15 @@ from loguru import logger
 from pydantic import TypeAdapter, ValidationError
 
 from m100bot.matching.models import MatchedItem
+from m100bot.sheets.addressing import CellChange
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
     user_id     INTEGER PRIMARY KEY,
     source_text TEXT NOT NULL,
     items_json  TEXT NOT NULL,          -- list[MatchedItem]
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    work_date   TEXT                      -- день отчёта (первое сообщение); пишем в этот день
 );
 
 CREATE TABLE IF NOT EXISTS writes (       -- что и когда записали в таблицу
@@ -59,6 +61,14 @@ CREATE TABLE IF NOT EXISTS report_lines (
     PRIMARY KEY (report_id, "row")
 );
 
+CREATE TABLE IF NOT EXISTS pending_writes (  -- «намерение»: запись в таблицу начата
+    user_id     INTEGER PRIMARY KEY,
+    key         TEXT NOT NULL,            -- что записываем: отчёт (токен черновика) / исправление
+    work_date   TEXT NOT NULL,
+    changes     TEXT NOT NULL,            -- [[row, old, new], ...] — ячейки до и после
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS bitrix_outbox (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     work_date   TEXT NOT NULL,
@@ -70,6 +80,19 @@ CREATE TABLE IF NOT EXISTS bitrix_outbox (
 """
 
 _ITEMS = TypeAdapter(list[MatchedItem])
+
+
+class DraftLostError(RuntimeError):
+    """Черновик не читается (формат сменился после обновления бота) и удалён.
+    Текст можно показать мастеру — повторно ошибка не возникнет."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "⚠️ Незаписанный отчёт не удалось прочитать после обновления бота, он удалён. "
+            "Пришлите отчёт заново."
+        )
+
+
 WriteMode = Literal["add", "set"]
 
 
@@ -83,6 +106,7 @@ class Draft:
     source_text: str
     items: list[MatchedItem]
     updated_at: str
+    work_date: date | None = None  # день отчёта; None — черновик старой версии бота
 
     @property
     def token(self) -> str:
@@ -124,6 +148,16 @@ class OutboxItem:
     payload: dict[str, Any]
     attempts: int
     last_error: str | None
+
+
+@dataclass(frozen=True)
+class PendingWrite:
+    """Запись в таблицу, начатая, но не подтверждённая журналом (ответ потерялся, сбой)."""
+
+    user_id: int
+    key: str
+    work_date: date
+    changes: list[CellChange]
 
 
 @dataclass(frozen=True)
@@ -176,7 +210,16 @@ class Storage:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         logger.info("Хранилище готово: {}", self.path.name)
+
+    async def _migrate(self) -> None:
+        """Колонки, добавленные после первой версии (CREATE IF NOT EXISTS их не добавит)."""
+        cur = await self.db.execute("PRAGMA table_info(drafts)")
+        columns = {r["name"] for r in await cur.fetchall()}
+        if "work_date" not in columns:
+            await self.db.execute("ALTER TABLE drafts ADD COLUMN work_date TEXT")
+            logger.info("SQLite: в drafts добавлена колонка work_date")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -215,19 +258,42 @@ class Storage:
 
     # ─────────────── Черновики ───────────────
 
-    async def save_draft(self, user_id: int, source_text: str, items: list[MatchedItem]) -> None:
-        """Один черновик на мастера: новый заменяет прежний."""
+    async def save_draft(
+        self,
+        user_id: int,
+        source_text: str,
+        items: list[MatchedItem],
+        *,
+        work_date: date | None = None,
+    ) -> None:
+        """Один черновик на мастера: новый заменяет прежний.
+
+        work_date — день отчёта: задаётся для нового черновика; None — оставить прежний.
+        """
         async with self._tx() as db:
-            await self._put_draft(db, user_id, source_text, items)
+            await self._put_draft(db, user_id, source_text, items, work_date)
 
     async def _put_draft(
-        self, db: aiosqlite.Connection, user_id: int, source_text: str, items: list[MatchedItem]
+        self,
+        db: aiosqlite.Connection,
+        user_id: int,
+        source_text: str,
+        items: list[MatchedItem],
+        work_date: date | None = None,
     ) -> None:
         await db.execute(
-            "INSERT INTO drafts(user_id, source_text, items_json, updated_at) VALUES(?,?,?,?) "
+            "INSERT INTO drafts(user_id, source_text, items_json, updated_at, work_date) "
+            "VALUES(?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET source_text=excluded.source_text, "
-            "items_json=excluded.items_json, updated_at=excluded.updated_at",
-            (user_id, source_text, _ITEMS.dump_json(items).decode(), self._stamp()),
+            "items_json=excluded.items_json, updated_at=excluded.updated_at, "
+            "work_date=COALESCE(excluded.work_date, drafts.work_date)",
+            (
+                user_id,
+                source_text,
+                _ITEMS.dump_json(items).decode(),
+                self._stamp(),
+                work_date.isoformat() if work_date else None,
+            ),
         )
 
     async def get_draft(self, user_id: int) -> Draft | None:
@@ -239,10 +305,19 @@ class Storage:
         try:
             items = _ITEMS.validate_json(row["items_json"])
         except ValidationError:
-            # формат MatchedItem мог измениться после обновления бота — не падаем, не стираем
-            logger.error("Черновик пользователя {} не читается (устарел формат?)", user_id)
-            return None
-        return Draft(user_id, row["source_text"], items, row["updated_at"])
+            # Формат MatchedItem сменился после обновления бота. Молча вернуть None нельзя:
+            # следующее сообщение тихо заменило бы отчёт. Удаляем и говорим мастеру один раз.
+            logger.error("Черновик пользователя {} не читается (устарел формат) — удаляю", user_id)
+            await self.delete_draft(user_id)
+            raise DraftLostError() from None
+        wd = row["work_date"]
+        return Draft(
+            user_id,
+            row["source_text"],
+            items,
+            row["updated_at"],
+            date.fromisoformat(wd) if wd else None,
+        )
 
     async def delete_draft(self, user_id: int) -> None:
         async with self._tx() as db:
@@ -268,6 +343,7 @@ class Storage:
         """
         async with self._tx() as db:
             ids = await self._insert_writes(db, user_id, work_date, writes)
+            await db.execute("DELETE FROM pending_writes WHERE user_id=?", (user_id,))
             cur = await db.execute(
                 "INSERT INTO reports(user_id, work_date, title, created_at) VALUES(?,?,?,?)",
                 (user_id, work_date.isoformat(), title, self._stamp()),
@@ -305,6 +381,7 @@ class Storage:
         Черновик не трогаем."""
         async with self._tx() as db:
             [write_id] = await self._insert_writes(db, user_id, work_date, [write])
+            await db.execute("DELETE FROM pending_writes WHERE user_id=?", (user_id,))
             for report_id, qty in line_updates:
                 await db.execute(
                     'UPDATE report_lines SET qty=? WHERE report_id=? AND "row"=?',
@@ -364,6 +441,38 @@ class Storage:
             )
             for r in rows
         ]
+
+    # ─────────────── Начатые записи ───────────────
+
+    async def save_pending(
+        self, user_id: int, key: str, work_date: date, changes: list[CellChange]
+    ) -> None:
+        """Перед записью в таблицу: что и куда пишем. Удаляется вместе с записью журнала."""
+        data = json.dumps([[c.row, c.old, c.new] for c in changes])
+        async with self._tx() as db:
+            await db.execute(
+                "INSERT INTO pending_writes(user_id, key, work_date, changes, created_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET key=excluded.key, "
+                "work_date=excluded.work_date, changes=excluded.changes, "
+                "created_at=excluded.created_at",
+                (user_id, key, work_date.isoformat(), data, self._stamp()),
+            )
+
+    async def get_pending(self, user_id: int) -> PendingWrite | None:
+        async with self._lock:
+            cur = await self.db.execute("SELECT * FROM pending_writes WHERE user_id=?", (user_id,))
+            r = await cur.fetchone()
+        if r is None:
+            return None
+        changes = [
+            CellChange(int(row), float(old), float(new))
+            for row, old, new in json.loads(r["changes"])
+        ]
+        return PendingWrite(r["user_id"], r["key"], date.fromisoformat(r["work_date"]), changes)
+
+    async def clear_pending(self, user_id: int) -> None:
+        async with self._tx() as db:
+            await db.execute("DELETE FROM pending_writes WHERE user_id=?", (user_id,))
 
     # ─────────────── Отчёты ───────────────
 

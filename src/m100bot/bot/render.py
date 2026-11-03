@@ -290,6 +290,8 @@ def item_edit_text(n: int, item: MatchedItem, catalog: Catalog) -> str:
 
 # ─────────────── /today ───────────────
 
+TODAY_STALE = "Этот список — за прошлый день. Откройте /today заново."
+
 
 def today_text(work_date: date, lines: list[TodayLine]) -> str:
     if not lines:
