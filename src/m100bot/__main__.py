@@ -30,13 +30,9 @@ def build_service(settings: Settings, storage: Storage) -> ReportService:
     """Собрать зависимости. Секреты читаются только из окружения (.env)."""
     sheets = SheetsClient.from_settings(settings)
     matcher = Matcher(LlmExtractor.from_settings(settings))
-    bitrix = (
-        BitrixClient(settings.bitrix_webhook_url, settings.bitrix_entity_type_id)
-        if settings.bitrix_webhook_url
-        else None
-    )
+    bitrix = BitrixClient.from_settings(settings)
     if bitrix is None:
-        logger.info("Битрикс24 не настроен (BITRIX_WEBHOOK_URL пуст) — отправка отключена")
+        logger.info("Битрикс24 не настроен — отправка отключена")
     return ReportService(sheets, storage, matcher, bitrix, timezone=settings.timezone)
 
 
@@ -74,6 +70,8 @@ async def main() -> None:
             with suppress(asyncio.CancelledError):
                 await worker
         await service.drain()  # фоновое сохранение синонимов
+        if isinstance(service.bitrix, BitrixClient):
+            await service.bitrix.aclose()
         await bot.session.close()
         await storage.close()
 

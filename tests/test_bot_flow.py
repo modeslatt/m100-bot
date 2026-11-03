@@ -174,8 +174,10 @@ async def test_confirm_writes_and_shows_summary_with_link(env: Env) -> None:
     assert card.buttons[0][1] == HTTPS + "17"  # ссылка на первую записанную строку
     assert env.sheets.writes == [(D, {17: 15.0, 18: 15.0}, "add")]
     assert await env.storage.get_draft(1) is None
-    assert env.bitrix.calls == []  # Битрикс — только через outbox
-    assert len(await env.storage.pending_outbox()) == 1
+    await env.service.drain()  # Битрикс — сразу после записи, в фоне
+    [sent] = env.bitrix.calls
+    assert sent.master == "Иван Петров" and len(sent.lines) == 2
+    assert await env.storage.pending_outbox() == []
 
 
 async def test_master_name_goes_to_bitrix_snapshot(env: Env) -> None:
@@ -274,28 +276,13 @@ async def test_ambiguous_items_are_asked_one_at_a_time(env: Env) -> None:
     assert not [m for m in env.chat.visible() if m.text.startswith("Позиция")]
 
 
-async def test_picked_variant_is_learned_as_synonym_only_after_writing(env: Env) -> None:
-    card = await report(env, amb("12 хомутов", 12, [43, 44]))
-    q = env.chat.find("Позиция 1:")
-    await env.chat.press(q.id, "2")  # хомут для фреонопровода
-    await env.service.drain()
-    assert env.sheets.added_synonyms == []  # пока не записано — не запоминаем
-
-    await env.chat.press(card.id, "✅ Записать")
-    await env.service.drain()
-
-    assert env.sheets.added_synonyms == [("хомутов", 44)]  # без объёма, молча
-    assert not [t for t in env.chat.texts() if "синоним" in t.lower() or "Запомн" in t]
-
-
-async def test_rejected_variant_is_not_learned_and_reported(env: Env) -> None:
+async def test_rejected_variant_is_reported(env: Env) -> None:
     card = await report(env, ok(17, 15), amb("хомуты", 12, [43, 44]))
     await env.chat.press(env.chat.find("Позиция 2:").id, "Нет нужного")
     await env.chat.press(card.id, "✅ Записать")
     await env.service.drain()
 
     assert "Нет в смете: «хомуты»" in card.text
-    assert env.sheets.added_synonyms == []
     assert await env.storage.get_draft(1) is None  # «нет в смете» черновик не держит
 
 

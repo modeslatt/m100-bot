@@ -375,45 +375,28 @@ async def test_synonyms_sheet_is_created_when_missing(
     assert fake.spreadsheet.calls["add_worksheet"] == 1  # второй раз не создаём
 
 
-async def test_add_and_load_synonym(client: SheetsClient, fake: FakeGspread) -> None:
-    await client.add_synonym("  Гофра   20-ка ", 64)
-    rows = fake.spreadsheet.sheets["Синонимы"].get_values()
-    assert rows[1][:2] == ["Гофра 20-ка", 64]
-    assert rows[1][2].startswith("Труба ПВХ с наружным диаметром 20")
-    assert await client.load_synonyms() == {"гофра 20-ка": 64}
-
-
-async def test_add_synonym_for_same_phrase_updates_row(
-    client: SheetsClient, fake: FakeGspread
+async def put_synonym(
+    client: SheetsClient, fake: FakeGspread, phrase: str, row: int, title_row: int
 ) -> None:
-    await client.add_synonym("гофра", 64)
-    await client.add_synonym("ГОФРА", 65)
-    rows = fake.spreadsheet.sheets["Синонимы"].get_values()
-    assert len(rows) == 2  # заголовок и одна строка: дубля нет
-    assert rows[1][1] == 65
-    assert await client.load_synonyms() == {"гофра": 65}
+    """Синоним, вписанный человеком: фраза, строка, название позиции из строки title_row."""
+    await client.load_synonyms()  # создаёт лист с заголовком
+    title = (await client.load_catalog()).by_row(title_row).name  # type: ignore[union-attr]
+    sheet = fake.spreadsheet.sheets["Синонимы"]
+    for col, value in enumerate((phrase, row, title), start=1):
+        sheet.set_cell(2, col, value)
+    client._synonyms = None
 
 
-async def test_synonyms_cache_dropped_after_add(client: SheetsClient) -> None:
-    assert await client.load_synonyms() == {}
-    await client.add_synonym("гофра", 64)
-    assert await client.load_synonyms() == {"гофра": 64}
+async def test_manual_synonym_is_loaded(client: SheetsClient, fake: FakeGspread) -> None:
+    await put_synonym(client, fake, "  Гофра   20-ка ", 64, 64)
+    assert await client.load_synonyms() == {"гофра 20-ка": 64}
 
 
 async def test_stale_synonym_after_row_shift_is_skipped(
     client: SheetsClient, fake: FakeGspread
 ) -> None:
-    await client.add_synonym("гофра", 64)
-    fake.spreadsheet.sheets["Синонимы"].set_cell(2, 2, 65)  # номер поправили, название осталось
-    client._synonyms = None
+    await put_synonym(client, fake, "гофра", 65, 64)  # номер поправили, название осталось
     assert await client.load_synonyms() == {}  # название в C не совпало с позицией 65
-
-
-async def test_add_synonym_validates_input(client: SheetsClient) -> None:
-    with pytest.raises(ValueError, match="пустая"):
-        await client.add_synonym("   ", 64)
-    with pytest.raises(ValueError, match="не является позицией"):
-        await client.add_synonym("гофра", 4)
 
 
 # ─────────────── Прочее ───────────────

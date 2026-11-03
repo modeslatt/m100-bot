@@ -3,7 +3,8 @@
 import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Iterable, Mapping
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,16 @@ import pytest
 
 from m100bot.matching.llm import LlmError
 from m100bot.matching.models import Intent, MatchedItem, MatchStatus, Understood
-from m100bot.services.report import ReportError, ReportService, backoff_seconds
+from m100bot.services.report import (
+    ReportError,
+    ReportService,
+    backoff_seconds,
+    distribute_correction,
+)
 from m100bot.sheets.addressing import CellChange, Mode
 from m100bot.sheets.catalog import Catalog
 from m100bot.sheets.client import SheetChangedError, SheetsError
-from m100bot.storage.db import Storage
+from m100bot.storage.db import NewWrite, Storage
 
 D = date(2026, 11, 2)
 USER = 111
@@ -37,8 +43,6 @@ class FakeSheets:
         self.done_error: Exception | None = None
         self.synonyms_error: Exception | None = None
         self.writes: list[tuple[date, dict[int, float], str]] = []
-        self.added_synonyms: list[tuple[str, int]] = []
-        self.synonym_error: Exception | None = None
         self.calls: Counter[str] = Counter()
 
     async def load_catalog(self) -> Catalog:
@@ -52,12 +56,6 @@ class FakeSheets:
         if self.synonyms_error:
             raise self.synonyms_error
         return self.synonyms
-
-    async def add_synonym(self, phrase: str, row: int) -> None:
-        self.calls["add_synonym"] += 1
-        if self.synonym_error:
-            raise self.synonym_error
-        self.added_synonyms.append((phrase, row))
 
     async def read_done(self, rows: Iterable[int]) -> dict[int, float]:
         self.calls["read_done"] += 1
@@ -84,18 +82,46 @@ class FakeSheets:
         return f"https://sheet.test/edit#range=B{row}"
 
 
+@dataclass
+class Sent:
+    """Один вызов save_report: item_id — что передали (None = создать), id — что вернули."""
+
+    item_id: int | None
+    id: int
+    title: str
+    work_date: date
+    master_id: int
+    master: str
+    lines: list[str]
+    sheet_url: str
+
+
 class FakeBitrix:
+    """Элементы CRM в памяти: save_report(None) создаёт новый, save_report(id) обновляет."""
+
     def __init__(self) -> None:
-        self.calls: list[tuple[date, str, list[str], str]] = []
+        self.calls: list[Sent] = []
+        self.items: dict[int, Sent] = {}
         self.errors: list[Exception] = []
 
-    async def upsert_daily_report(
-        self, d: date, master: str, lines: list[str], sheet_url: str
+    async def save_report(
+        self,
+        item_id: int | None,
+        *,
+        title: str,
+        work_date: date,
+        master_id: int,
+        master: str,
+        lines: list[str],
+        sheet_url: str,
     ) -> int:
         if self.errors:
             raise self.errors.pop(0)
-        self.calls.append((d, master, list(lines), sheet_url))
-        return len(self.calls)
+        new_id = item_id if item_id is not None else 100 + len(self.items)
+        sent = Sent(item_id, new_id, title, work_date, master_id, master, list(lines), sheet_url)
+        self.calls.append(sent)
+        self.items[new_id] = sent
+        return new_id
 
 
 class FakeMatcher:
@@ -166,7 +192,10 @@ def clock() -> Clock:
 def service(
     sheets: FakeSheets, storage: Storage, bitrix: FakeBitrix, catalog: Catalog, clock: Clock
 ) -> ReportService:
-    return ReportService(sheets, storage, FakeMatcher(), bitrix, today=lambda: D, clock=clock)
+    # send_now=False: здесь проверяется сама очередь; отправку сразу — отдельные тесты ниже
+    return ReportService(
+        sheets, storage, FakeMatcher(), bitrix, today=lambda: D, clock=clock, send_now=False
+    )
 
 
 async def draft(storage: Storage, *items: MatchedItem, text: str = "исходный текст") -> None:
@@ -496,18 +525,35 @@ async def test_bitrix_down_does_not_affect_confirm(
     assert len(await storage.pending_outbox()) == 1
 
 
-async def test_outbox_snapshot_covers_the_whole_day(
-    service: ReportService, storage: Storage
-) -> None:
-    """Элемент за дату обновляется целиком — второй отчёт не должен затереть первый."""
+async def test_each_report_is_its_own_outbox_task(service: ReportService, storage: Storage) -> None:
+    """Каждый подтверждённый отчёт — свой элемент CRM, только его объёмы."""
     await draft(storage, ok(17, 15))
     await service.confirm(USER, D)
     await draft(storage, ok(44, 10), ok(17, 5))
     await service.confirm(USER, D)
 
     first, second = await storage.pending_outbox()
-    assert len(first.payload["lines"]) == 1
-    assert [line.rsplit("— ", 1)[1] for line in second.payload["lines"]] == ["20 м", "10 шт"]
+    assert first.payload["report_id"] != second.payload["report_id"]
+    assert [line.rsplit("— ", 1)[1] for line in first.payload["lines"]] == ["15 м"]
+    assert [line.rsplit("— ", 1)[1] for line in second.payload["lines"]] == ["5 м", "10 шт"]
+
+
+async def test_report_title_has_confirmation_time(
+    sheets: FakeSheets, storage: Storage, bitrix: FakeBitrix
+) -> None:
+    service = ReportService(
+        sheets,
+        storage,
+        FakeMatcher(),
+        bitrix,
+        today=lambda: D,
+        now=lambda: datetime(2026, 11, 2, 14, 35, 59),
+        send_now=False,
+    )
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    [item] = await storage.pending_outbox()
+    assert item.payload["title"] == "Отчет от 02.11.2026 14:35"
 
 
 async def test_no_bitrix_configured_means_no_outbox(
@@ -529,11 +575,15 @@ async def test_flush_sends_and_marks_done(
     result = await service.flush_outbox()
 
     assert (result.sent, result.failed) == (1, 0)
-    [(d, master, lines, url)] = bitrix.calls
-    assert (d, master) == (D, "Иван") and lines[0].endswith("— 15 м")
-    assert url.startswith("https://sheet.test")
+    [sent] = bitrix.calls
+    assert sent.item_id is None  # новый элемент
+    assert (sent.work_date, sent.master, sent.master_id) == (D, "Иван", USER)
+    assert sent.title.startswith("Отчет от ") and sent.lines[0].endswith("— 15 м")
+    assert sent.sheet_url.startswith("https://sheet.test")
     assert await storage.pending_outbox() == []
     assert (await service.flush_outbox()).sent == 0  # второй раз слать нечего
+    [report] = await storage.reports_with_row(USER, D, 17)
+    assert report.bitrix_id == sent.id  # id элемента запомнен для исправлений
 
 
 async def test_flush_failure_keeps_item_with_sanitized_error(
@@ -569,25 +619,55 @@ async def test_flush_backoff_then_success(
     assert len(bitrix.calls) == 1 and await storage.pending_outbox() == []
 
 
-async def test_older_snapshot_never_overwrites_newer_one(
+async def test_two_reports_two_items(
+    service: ReportService, bitrix: FakeBitrix, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    await draft(storage, ok(17, 5))
+    await service.confirm(USER, D)
+
+    result = await service.flush_outbox()
+
+    assert (result.sent, result.superseded) == (2, 0)
+    assert [(c.item_id, c.lines[0].rsplit("— ", 1)[1]) for c in bitrix.calls] == [
+        (None, "15 м"),
+        (None, "5 м"),  # второй отчёт — свой элемент, первый не затронут
+    ]
+    assert len(bitrix.items) == 2
+
+
+async def test_older_task_of_same_report_never_overwrites_newer_one(
     service: ReportService, bitrix: FakeBitrix, storage: Storage, clock: Clock
 ) -> None:
-    """Первое задание не ушло; пока ждало, пришло второе (полный снимок дня). Слать нужно
-    только второе — иначе повтор старого откатил бы Битрикс назад."""
+    """Задание отчёта не ушло; пока ждало, мастер исправил объём. Слать нужно только
+    свежее — иначе повтор старого откатил бы элемент назад."""
     bitrix.errors = [RuntimeError("503")]
     await draft(storage, ok(17, 15))
     await service.confirm(USER, D)
-    await service.flush_outbox()  # первое не ушло
+    await service.flush_outbox()  # не ушло
 
-    await draft(storage, ok(17, 5))
-    await service.confirm(USER, D)
+    await service.correct_today(USER, 17, 12)
     clock.now += 3600
     result = await service.flush_outbox()
 
     assert (result.sent, result.superseded) == (1, 1)
-    assert len(bitrix.calls) == 1
-    assert bitrix.calls[0][2][0].endswith("— 20 м")  # снимок целого дня
+    [sent] = bitrix.calls
+    assert sent.item_id is None and sent.lines == [
+        "Фреонопровод медный, Д6,35 TEC TUBE cips — 12 м (исправлено, было 15 м)"
+    ]
     assert await storage.pending_outbox() == []
+
+
+async def test_legacy_day_snapshots_are_dropped(
+    service: ReportService, bitrix: FakeBitrix, storage: Storage
+) -> None:
+    """Задания прошлой версии (снимок дня, без report_id) не отправляются."""
+    await storage.record_correction(
+        USER, D, NewWrite(17, 1, "add", 0), outbox_payloads=[{"master": "Иван", "lines": []}]
+    )
+    assert (await service.flush_outbox()).sent == 0
+    assert bitrix.calls == [] and await storage.pending_outbox() == []
 
 
 async def test_different_days_and_masters_are_sent_separately(
@@ -602,6 +682,39 @@ async def test_different_days_and_masters_are_sent_separately(
 
     result = await service.flush_outbox()
     assert (result.sent, result.superseded) == (3, 0)
+
+
+async def test_send_now_after_confirm_and_correction(
+    sheets: FakeSheets, storage: Storage, bitrix: FakeBitrix
+) -> None:
+    service = ReportService(sheets, storage, FakeMatcher(), bitrix, today=lambda: D)
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D, master="Иван")
+    await service.drain()
+    assert [c.master for c in bitrix.calls] == ["Иван"]  # ушло сразу, без фоновой задачи
+    assert await storage.pending_outbox() == []
+
+    await service.correct_today(USER, 17, 12, master="Иван")
+    await service.drain()
+    first, second = bitrix.calls
+    assert second.item_id == first.id  # исправление обновило тот же элемент
+    assert second.lines[0].endswith("— 12 м (исправлено, было 15 м)")
+
+
+async def test_send_now_failure_stays_in_outbox(
+    sheets: FakeSheets, storage: Storage, bitrix: FakeBitrix, clock: Clock
+) -> None:
+    service = ReportService(sheets, storage, FakeMatcher(), bitrix, today=lambda: D, clock=clock)
+    bitrix.errors = [RuntimeError("Битрикс лёг")]
+    await draft(storage, ok(17, 15))
+    text = await service.confirm(USER, D)
+    await service.drain()
+
+    assert text.startswith("✅ Записано")  # мастер сбоя Битрикса не видит
+    [item] = await storage.pending_outbox()
+    assert item.attempts == 1  # очередь повторит позже, с паузой
+    clock.now += backoff_seconds(1) + 1
+    assert (await service.flush_outbox()).sent == 1
 
 
 def test_backoff_grows_and_is_capped() -> None:
@@ -627,17 +740,78 @@ async def test_correct_today_sets_value_and_journals_prev(
     assert [(r.mode, r.qty, r.prev_value) for r in records] == [("add", 15, 0.0), ("set", 12, 15.0)]
 
 
-async def test_correction_goes_to_bitrix_outbox_as_replacement(
+async def test_correction_updates_the_report_item(
+    service: ReportService, bitrix: FakeBitrix, storage: Storage
+) -> None:
+    await draft(storage, ok(17, 15), ok(44, 10))
+    await service.confirm(USER, D)
+    await service.flush_outbox()
+    [created] = bitrix.calls
+
+    await service.correct_today(USER, 17, 12)
+    assert len(bitrix.calls) == 1  # напрямую — никогда, только через очередь
+    await service.flush_outbox()
+
+    updated = bitrix.calls[-1]
+    assert updated.item_id == created.id and updated.title == created.title
+    assert updated.lines == [
+        "Фреонопровод медный, Д6,35 TEC TUBE cips — 12 м (исправлено, было 15 м)",
+        created.lines[1],  # остальные строки отчёта — как были
+    ]
+
+
+async def test_correction_spread_over_reports_of_the_day(
+    service: ReportService, bitrix: FakeBitrix, storage: Storage
+) -> None:
+    """Строка была в двух отчётах (15 + 5 = 20). Исправили на 12: уменьшение снимается
+    с последнего отчёта (5 → 0), остаток — с первого (15 → 12). Меняются оба элемента."""
+    await draft(storage, ok(17, 15))
+    await service.confirm(USER, D)
+    await draft(storage, ok(17, 5), ok(44, 1))
+    await service.confirm(USER, D)
+    await service.flush_outbox()
+    first_id, second_id = (c.id for c in bitrix.calls)
+
+    await service.correct_today(USER, 17, 12)
+    await service.flush_outbox()
+
+    by_item = {c.item_id: c.lines for c in bitrix.calls[2:]}
+    assert by_item[first_id][0].endswith("— 12 м (исправлено, было 15 м)")
+    assert by_item[second_id][0].endswith("— 0 м (исправлено, было 5 м)")
+    assert by_item[second_id][1].endswith("— 1 шт")
+
+
+async def test_increase_goes_to_the_latest_report_only(
     service: ReportService, bitrix: FakeBitrix, storage: Storage
 ) -> None:
     await draft(storage, ok(17, 15))
     await service.confirm(USER, D)
-    await service.correct_today(USER, 17, 12)
-
-    assert bitrix.calls == []
+    await draft(storage, ok(17, 5))
+    await service.confirm(USER, D)
     await service.flush_outbox()
-    [(_, _, lines, _)] = bitrix.calls  # старый снимок заменён новым
-    assert lines[0].endswith("— 12 м")  # set заменил, а не прибавил к 15
+
+    await service.correct_today(USER, 17, 30)
+    result = await service.flush_outbox()
+
+    assert result.sent == 1  # первый отчёт не тронут
+    assert bitrix.calls[-1].lines[0].endswith("— 15 м (исправлено, было 5 м)")
+
+
+@pytest.mark.parametrize(
+    ("values", "target", "expected"),
+    [
+        ([15], 12, [12]),
+        ([15, 5], 30, [15, 15]),
+        ([15, 5], 18, [15, 3]),
+        ([15, 5], 12, [12, 0]),
+        ([15, 5], 0, [0, 0]),
+        ([15, 5], 20, [15, 5]),
+        ([], 5, []),
+        ([0.1, 0.2], 0.4, [0.1, 0.3]),
+    ],
+)
+def test_distribute_correction(values: list[float], target: float, expected: list[float]) -> None:
+    assert distribute_correction(values, target) == expected
 
 
 async def test_correct_today_to_zero_clears(

@@ -6,8 +6,9 @@
 - в таблицу пишем только из `confirm` / `correct_today`, то есть после явного «Записать»;
 - сбой Sheets не стирает черновик — мастер получает понятный текст и жмёт кнопку ещё раз;
 - Битрикс24 напрямую не трогаем: задание кладётся в outbox (в той же транзакции, что
-  журнал) и уходит отдельно, `flush_outbox`, с повторами. Недоступный Битрикс не мешает
-  мастеру закончить отчёт;
+  журнал) и уходит отдельно, `flush_outbox` (сразу в фоне и потом с повторами).
+  Недоступный Битрикс не мешает мастеру закончить отчёт. Каждый подтверждённый отчёт —
+  свой элемент CRM; исправление меняет элементы тех отчётов, где была позиция;
 - каждая запись попадает в журнал `writes` с prev_value — значением ячейки до записи;
 - кнопки карточки несут отпечаток черновика (`Draft.token`): нажатие на старую карточку
   не должно ничего записать, поэтому правящие методы принимают `token` и сверяют его
@@ -30,11 +31,10 @@ from loguru import logger
 from m100bot.matching.llm import LlmError
 from m100bot.matching.matcher import resolve_position
 from m100bot.matching.models import MatchedItem, MatchStatus, Understood
-from m100bot.matching.phrase import synonym_key
 from m100bot.sheets.addressing import CellChange, Mode
 from m100bot.sheets.catalog import Catalog, Position
 from m100bot.sheets.client import SheetChangedError, SheetsError
-from m100bot.storage.db import Draft, NewWrite, OutboxItem, Storage, fold_writes
+from m100bot.storage.db import Draft, NewWrite, OutboxItem, Report, Storage, fold_writes
 
 BACKOFF_BASE_S = 30.0  # пауза перед второй попыткой отправки в Битрикс
 BACKOFF_MAX_S = 900.0  # дальше — раз в 15 минут, пока не получится
@@ -57,7 +57,6 @@ class StaleCardError(ReportError):
 class SheetsLike(Protocol):
     async def load_catalog(self) -> Catalog: ...
     async def load_synonyms(self) -> dict[str, int]: ...
-    async def add_synonym(self, phrase: str, row: int) -> None: ...
     async def read_done(self, rows: Iterable[int]) -> dict[int, float]: ...
     async def write_volumes(
         self, d: date, volumes: dict[int, float], *, mode: Mode = "add"
@@ -66,8 +65,16 @@ class SheetsLike(Protocol):
 
 
 class BitrixLike(Protocol):
-    async def upsert_daily_report(
-        self, d: date, master: str, lines: list[str], sheet_url: str
+    async def save_report(
+        self,
+        item_id: int | None,
+        *,
+        title: str,
+        work_date: date,
+        master_id: int,
+        master: str,
+        lines: list[str],
+        sheet_url: str,
     ) -> int: ...
 
 
@@ -82,7 +89,7 @@ class FlushResult:
     sent: int = 0  # ушло в Битрикс
     failed: int = 0  # не получилось, повторим позже
     waiting: int = 0  # ещё ждёт паузы перед повтором
-    superseded: int = 0  # заменено более новым снимком того же дня
+    superseded: int = 0  # заменено более новым заданием того же отчёта
 
 
 @dataclass(frozen=True)
@@ -120,6 +127,29 @@ def backoff_seconds(attempts: int) -> float:
     return min(BACKOFF_BASE_S * 2 ** max(attempts - 1, 0), BACKOFF_MAX_S)
 
 
+def distribute_correction(values: list[float], target: float) -> list[float]:
+    """Новые значения строки в отчётах дня, чтобы сумма стала `target`.
+
+    values — значения в отчётах по порядку подтверждения. Прибавка уходит в последний
+    отчёт; уменьшение снимается с последнего, потом с предыдущих (не ниже нуля).
+    Так меняется как можно меньше отчётов — и скорее всего тот, что прислан последним.
+    """
+    new = list(values)
+    if not new:
+        return new
+    diff = round(target - sum(values), 6)
+    if diff >= 0:
+        new[-1] = round(new[-1] + diff, 6)
+        return new
+    for i in range(len(new) - 1, -1, -1):
+        take = min(new[i], -diff)
+        new[i] = round(new[i] - take, 6)
+        diff = round(diff + take, 6)
+        if diff >= 0:
+            break
+    return new
+
+
 def _safe_error(exc: BaseException) -> str:
     """Текст ошибки для журнала: без адресов — в URL вебхука Битрикса лежит секрет."""
     text = re.sub(r"https?://\S+", "<url>", str(exc))
@@ -138,6 +168,8 @@ class ReportService:
         recognize_budget_s: float = RECOGNIZE_BUDGET_S,
         today: Callable[[], date] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
+        send_now: bool = True,
     ) -> None:
         self.sheets = sheets
         self.storage = storage
@@ -146,10 +178,13 @@ class ReportService:
         self._tz = ZoneInfo(timezone)
         self._today = today or (lambda: datetime.now(self._tz).date())
         self._clock = clock
+        self._now = now or (lambda: datetime.now(self._tz))  # время в названии отчёта
         self._recognize_budget_s = recognize_budget_s
         self._user_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._flush_lock = asyncio.Lock()
         self._next_try: dict[int, float] = {}  # id задания outbox → когда можно повторить
+        # Отправлять в Битрикс сразу после записи (в фоне); False — только фоновой задачей
+        self._send_now = send_now
         self._last_synonyms: dict[str, int] = {}  # если лист «Синонимы» не прочитался
         self._background: set[asyncio.Task[None]] = set()
 
@@ -315,7 +350,6 @@ class ReportService:
                     raise ReportError("Этой позиции больше нет в таблице. Пришлите отчёт заново.")
                 left = await self._remaining_for(catalog, row)
                 new = resolve_position(item, pos).with_remaining(left)
-                new.picked = True  # после записи запомним фразу как синоним
             return await self._save(user_id, draft, idx, new)
 
     async def set_item_qty(
@@ -419,33 +453,7 @@ class ReportService:
                 leftover=leftover,
                 what="Отчёт записан в таблицу",
             )
-            self._learn_synonyms(ready)
             return self._confirmation_text(work_date, ready, leftover, skipped, changes, catalog)
-
-    # ─────────────── Синонимы «за кадром» ───────────────
-
-    def _learn_synonyms(self, ready: list[MatchedItem]) -> None:
-        """Варианты, выбранные мастером кнопкой и подтверждённые записью, запоминаем молча.
-
-        Только после записи: неверно выбранный и отменённый вариант в синонимы не попадёт.
-        Идёт в фоне — мастер не ждёт обращения к таблице; сбой только в лог.
-        """
-        pairs: dict[str, int] = {}
-        for item in ready:
-            if item.picked and item.row is not None:
-                key = synonym_key(item.phrase, item.qty)
-                if len(key) >= 3:
-                    pairs[key] = item.row
-        if pairs:
-            self._spawn(self._save_synonyms(pairs))
-
-    async def _save_synonyms(self, pairs: dict[str, int]) -> None:
-        for key, row in pairs.items():
-            try:
-                await self.sheets.add_synonym(key, row)
-                logger.info("Запомнил синоним «{}» → строка {}", key, row)
-            except Exception as e:
-                logger.warning("Синоним «{}» не сохранён: {}", key, e)
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(coro)
@@ -554,48 +562,110 @@ class ReportService:
         объёмы. Поэтому говорим об этом прямо и просим не повторять.
         """
         try:
-            payload = await self._bitrix_payload(user_id, work_date, writes, master, catalog)
             if leftover is None:
-                await self.storage.record_correction(
-                    user_id, work_date, writes[0], outbox_payload=payload
-                )
+                await self._record_correction(user_id, work_date, writes[0], master, catalog)
             else:
-                await self.storage.record_confirmation(
-                    user_id, work_date, writes, outbox_payload=payload, leftover=leftover
-                )
+                await self._record_report(user_id, work_date, writes, master, catalog, leftover)
         except Exception as e:
             logger.exception("{}, но журнал не сохранён: {}", what, writes)
             raise ReportError(
                 "⚠️ В таблицу записано, но сохранить журнал не удалось. Повторно не нажимайте — "
                 "объёмы удвоятся. Сообщите администратору."
             ) from e
+        if self.bitrix is not None and self._send_now:
+            # Сразу, не дожидаясь фоновой задачи: мастер не ждёт, сбой останется в очереди.
+            self._spawn(self._flush_now())
 
-    async def _bitrix_payload(
+    async def _flush_now(self) -> None:
+        try:
+            await self.flush_outbox()
+        except Exception:
+            logger.exception("Отправка в Битрикс сразу после записи не удалась, повторит очередь")
+
+    async def _record_report(
         self,
         user_id: int,
         work_date: date,
-        new_writes: list[NewWrite],
+        writes: list[NewWrite],
         master: str,
         catalog: Catalog,
-    ) -> dict | None:
-        """Снимок всего дня мастера для Битрикса (None — Битрикс не настроен).
+        leftover: list[MatchedItem],
+    ) -> None:
+        """Новый отчёт: журнал + отчёт + задание «создать элемент CRM» (если Битрикс есть)."""
+        title = f"Отчет от {self._now():%d.%m.%Y %H:%M}"
+        payload = None
+        if self.bitrix is not None:
+            lines = [self._describe(catalog, w.row, w.qty) for w in writes]
+            payload = self._bitrix_payload(
+                user_id, work_date, title, master, lines, [w.row for w in writes]
+            )
+        await self.storage.record_confirmation(
+            user_id, work_date, writes, outbox_payload=payload, leftover=leftover, title=title
+        )
 
-        Элемент за дату обновляется целиком, поэтому шлём все объёмы дня, а не только
-        этот отчёт: иначе второй отчёт за день затёр бы первый.
-        """
-        if self.bitrix is None:
-            return None
-        existing = await self.storage.get_writes(user_id, work_date)
-        totals = fold_writes([*existing, *new_writes])
-        rows = sorted(totals)
-        lines = [self._describe(catalog, row, totals[row]) for row in rows]
-        link_row = rows[0] if rows else new_writes[0].row
+    async def _record_correction(
+        self, user_id: int, work_date: date, write: NewWrite, master: str, catalog: Catalog
+    ) -> None:
+        """Исправление: новое значение строки раскладывается по отчётам дня, где она была
+        (`distribute_correction`); изменённые отчёты уходят в Битрикс заново целиком."""
+        reports = await self.storage.reports_with_row(user_id, work_date, write.row)
+        if not reports:
+            logger.info("Исправление строки {}: отчётов за {} нет", write.row, work_date)
+        old = [self._line_qty(r, write.row) for r in reports]
+        new = distribute_correction(old, write.qty)
+        changed = [(r, q) for r, o, q in zip(reports, old, new, strict=True) if q != o]
+        payloads = []
+        if self.bitrix is not None:
+            for report, qty in changed:
+                lines = [
+                    self._describe_line(
+                        catalog, line.row, qty if line.row == write.row else line.qty, line.reported
+                    )
+                    for line in report.lines
+                ]
+                rows = [line.row for line in report.lines]
+                payload = self._bitrix_payload(
+                    user_id, work_date, report.title, master, lines, rows
+                )
+                payloads.append({**payload, "report_id": report.id})
+        await self.storage.record_correction(
+            user_id,
+            work_date,
+            write,
+            line_updates=[(r.id, q) for r, q in changed],
+            outbox_payloads=payloads,
+        )
+
+    @staticmethod
+    def _line_qty(report: Report, row: int) -> float:
+        return next(line.qty for line in report.lines if line.row == row)
+
+    def _describe_line(self, catalog: Catalog, row: int, qty: float, reported: float) -> str:
+        """Строка отчёта для CRM; исправленная — с пометкой, сколько было в отчёте."""
+        text = self._describe(catalog, row, qty)
+        if qty != reported:
+            pos = catalog.by_row(row)
+            was = f"{fmt_qty(reported)} {pos.unit if pos else ''}".rstrip()
+            text += f" (исправлено, было {was})"
+        return text
+
+    def _bitrix_payload(
+        self,
+        user_id: int,
+        work_date: date,
+        title: str,
+        master: str,
+        lines: list[str],
+        rows: list[int],
+    ) -> dict[str, Any]:
+        """Задание outbox: элемент CRM одного отчёта целиком."""
         return {
             "user_id": user_id,
             "master": master,
             "work_date": work_date.isoformat(),
+            "title": title,
             "lines": lines,
-            "sheet_url": self.sheets.row_link(link_row),
+            "sheet_url": self.sheets.row_link(min(rows)),
         }
 
     @staticmethod
@@ -647,34 +717,34 @@ class ReportService:
     async def flush_outbox(self) -> FlushResult:
         """Отправить накопившиеся задания в Битрикс; вызывать периодически.
 
-        Для одного мастера и даты важен только самый свежий снимок — старые помечаются
-        выполненными без отправки, чтобы повтор давнего задания не откатил Битрикс назад.
+        Задание = элемент CRM одного отчёта целиком. Для отчёта важно только самое свежее
+        задание (после исправления) — старые помечаются выполненными без отправки.
+        id созданного элемента хранится в отчёте: следующие задания обновляют его.
         Неудачи копятся с паузами 30 с … 15 мин и повторяются, пока не получится.
         """
         if self.bitrix is None:
             return FlushResult()
         async with self._flush_lock:
             pending = await self.storage.pending_outbox()
-            latest: dict[tuple[date, object], OutboxItem] = {}
-            for item in pending:  # по возрастанию id: последний выигрывает
-                latest[(item.work_date, item.payload.get("user_id"))] = item
-            stale = [
-                i.id for i in pending if latest[(i.work_date, i.payload.get("user_id"))] is not i
-            ]
+            legacy = [i.id for i in pending if "report_id" not in i.payload]
+            if legacy:  # снимки дня из прошлой версии бота — у элементов была другая схема
+                await self.storage.mark_outbox_done(legacy, note="старый формат, не отправлено")
+            current = [i for i in pending if "report_id" in i.payload]
+            latest: dict[int, OutboxItem] = {}
+            for item in current:  # по возрастанию id: последний выигрывает
+                latest[item.payload["report_id"]] = item
+            stale = [i.id for i in current if latest[i.payload["report_id"]] is not i]
             if stale:
-                await self.storage.mark_outbox_done(stale, note="заменено более новым снимком")
+                await self.storage.mark_outbox_done(stale, note="заменено более новым заданием")
 
             sent = failed = waiting = 0
             now = self._clock()
-            for item in latest.values():
+            for report_id, item in latest.items():
                 if self._next_try.get(item.id, 0.0) > now:
                     waiting += 1
                     continue
                 try:
-                    p = item.payload
-                    await self.bitrix.upsert_daily_report(
-                        item.work_date, p["master"], p["lines"], p["sheet_url"]
-                    )
+                    bitrix_id = await self._send_report(report_id, item)
                 except Exception as e:
                     failed += 1
                     error = _safe_error(e)
@@ -691,8 +761,26 @@ class ReportService:
                     sent += 1
                     self._next_try.pop(item.id, None)
                     await self.storage.mark_outbox_done([item.id])
-                    logger.info("Битрикс: отчёт за {} отправлен", item.work_date)
+                    logger.info("Битрикс: «{}» → элемент {}", item.payload["title"], bitrix_id)
             return FlushResult(sent, failed, waiting, len(stale))
+
+    async def _send_report(self, report_id: int, item: OutboxItem) -> int:
+        assert self.bitrix is not None
+        report = await self.storage.get_report(report_id)
+        known_id = report.bitrix_id if report else None
+        p = item.payload
+        bitrix_id = await self.bitrix.save_report(
+            known_id,
+            title=p["title"],
+            work_date=item.work_date,
+            master_id=p["user_id"],
+            master=p["master"],
+            lines=p["lines"],
+            sheet_url=p["sheet_url"],
+        )
+        if bitrix_id != known_id:
+            await self.storage.set_bitrix_id(report_id, bitrix_id)
+        return bitrix_id
 
 
 async def run_outbox_worker(service: ReportService, interval_s: float = 60.0) -> None:

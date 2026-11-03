@@ -1,4 +1,4 @@
-"""SQLite: черновики отчётов, журнал записей, outbox для Битрикса.
+"""SQLite: черновики, журнал записей, подтверждённые отчёты, outbox для Битрикса.
 
 Одно соединение aiosqlite; все операции идут под одной блокировкой, потому что
 на одном соединении читатель увидел бы незавершённую транзакцию соседа.
@@ -40,6 +40,23 @@ CREATE TABLE IF NOT EXISTS writes (       -- что и когда записал
     mode        TEXT NOT NULL,            -- add | set
     prev_value  REAL,                     -- значение ячейки до записи (для отката)
     created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reports (      -- подтверждённый отчёт = элемент CRM в Битриксе
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    work_date   TEXT NOT NULL,
+    title       TEXT NOT NULL,            -- «Отчет от 03.11.2026 14:35»
+    created_at  TEXT NOT NULL,
+    bitrix_id   INTEGER                   -- id элемента CRM, когда он создан
+);
+
+CREATE TABLE IF NOT EXISTS report_lines (
+    report_id   INTEGER NOT NULL REFERENCES reports(id),
+    "row"       INTEGER NOT NULL,
+    qty         REAL NOT NULL,            -- текущее значение (после исправлений)
+    reported    REAL NOT NULL,            -- как было в отчёте
+    PRIMARY KEY (report_id, "row")
 );
 
 CREATE TABLE IF NOT EXISTS bitrix_outbox (
@@ -109,12 +126,27 @@ class OutboxItem:
     last_error: str | None
 
 
+@dataclass(frozen=True)
+class ReportLine:
+    row: int
+    qty: float  # текущее значение (после исправлений)
+    reported: float  # как было в отчёте
+
+
+@dataclass(frozen=True)
+class Report:
+    id: int
+    user_id: int
+    work_date: date
+    title: str
+    bitrix_id: int | None
+    lines: list[ReportLine]
+
+
 def fold_writes(writes: Iterable[NewWrite | WriteRecord]) -> dict[int, float]:
     """Сколько мастер сообщил за день по каждой строке, по журналу в порядке записи.
 
-    add прибавляет, set заменяет; строки с нулём не возвращаются. Это снимок «что мастер
-    отчитал за день»: именно он уходит в Битрикс — заново целиком, а не дельтой, потому
-    что элемент за дату обновляется, а не дополняется.
+    add прибавляет, set заменяет; строки с нулём не возвращаются (для /today).
     """
     totals: dict[int, float] = {}
     for w in writes:
@@ -226,15 +258,30 @@ class Storage:
         *,
         outbox_payload: dict[str, Any] | None,
         leftover: list[MatchedItem],
+        title: str = "",
     ) -> list[int]:
         """Подтверждённый отчёт, уже записанный в таблицу: одна транзакция.
 
-        Журнал `writes` + задание в outbox Битрикса (если задано) + черновик: остаток
-        неразобранных позиций сохраняется, иначе черновик удаляется.
-        Возвращает id строк журнала.
+        Журнал `writes` + отчёт (`reports`, `report_lines`) + задание в outbox Битрикса
+        (если задано; к нему добавляется `report_id`) + черновик: остаток неразобранных
+        позиций сохраняется, иначе черновик удаляется. Возвращает id строк журнала.
         """
         async with self._tx() as db:
             ids = await self._insert_writes(db, user_id, work_date, writes)
+            cur = await db.execute(
+                "INSERT INTO reports(user_id, work_date, title, created_at) VALUES(?,?,?,?)",
+                (user_id, work_date.isoformat(), title, self._stamp()),
+            )
+            report_id = cur.lastrowid
+            for w in writes:
+                await db.execute(
+                    'INSERT INTO report_lines(report_id, "row", qty, reported) VALUES(?,?,?,?) '
+                    'ON CONFLICT(report_id, "row") DO UPDATE SET qty=qty+excluded.qty, '
+                    "reported=reported+excluded.reported",
+                    (report_id, w.row, w.qty, w.qty),
+                )
+            if outbox_payload is not None:
+                outbox_payload = {**outbox_payload, "report_id": report_id}
             await self._insert_outbox(db, work_date, outbox_payload)
             if leftover:
                 cur = await db.execute("SELECT source_text FROM drafts WHERE user_id=?", (user_id,))
@@ -250,12 +297,21 @@ class Storage:
         work_date: date,
         write: NewWrite,
         *,
-        outbox_payload: dict[str, Any] | None,
+        line_updates: Iterable[tuple[int, float]] = (),
+        outbox_payloads: Iterable[dict[str, Any]] = (),
     ) -> int:
-        """Исправление уже записанного за день: журнал + outbox, черновик не трогаем."""
+        """Исправление уже записанного за день, одна транзакция: журнал + новые значения
+        строки `write.row` в отчётах (`line_updates`: report_id → qty) + задания outbox.
+        Черновик не трогаем."""
         async with self._tx() as db:
             [write_id] = await self._insert_writes(db, user_id, work_date, [write])
-            await self._insert_outbox(db, work_date, outbox_payload)
+            for report_id, qty in line_updates:
+                await db.execute(
+                    'UPDATE report_lines SET qty=? WHERE report_id=? AND "row"=?',
+                    (qty, report_id, write.row),
+                )
+            for payload in outbox_payloads:
+                await self._insert_outbox(db, work_date, payload)
         return write_id
 
     async def _insert_writes(
@@ -309,6 +365,43 @@ class Storage:
             for r in rows
         ]
 
+    # ─────────────── Отчёты ───────────────
+
+    async def get_report(self, report_id: int) -> Report | None:
+        async with self._lock:
+            cur = await self.db.execute("SELECT * FROM reports WHERE id=?", (report_id,))
+            r = await cur.fetchone()
+            if r is None:
+                return None
+            cur = await self.db.execute(
+                'SELECT "row", qty, reported FROM report_lines WHERE report_id=? ORDER BY "row"',
+                (report_id,),
+            )
+            lines = [ReportLine(x["row"], x["qty"], x["reported"]) for x in await cur.fetchall()]
+        return Report(
+            r["id"],
+            r["user_id"],
+            date.fromisoformat(r["work_date"]),
+            r["title"],
+            r["bitrix_id"],
+            lines,
+        )
+
+    async def reports_with_row(self, user_id: int, work_date: date, row: int) -> list[Report]:
+        """Отчёты мастера за дату, где есть строка `row`, по порядку подтверждения."""
+        async with self._lock:
+            cur = await self.db.execute(
+                "SELECT r.id FROM reports r JOIN report_lines l ON l.report_id = r.id "
+                'WHERE r.user_id=? AND r.work_date=? AND l."row"=? ORDER BY r.id',
+                (user_id, work_date.isoformat(), row),
+            )
+            ids = [x["id"] for x in await cur.fetchall()]
+        return [r for i in ids if (r := await self.get_report(i)) is not None]
+
+    async def set_bitrix_id(self, report_id: int, bitrix_id: int) -> None:
+        async with self._tx() as db:
+            await db.execute("UPDATE reports SET bitrix_id=? WHERE id=?", (bitrix_id, report_id))
+
     async def pending_outbox(self) -> list[OutboxItem]:
         """Неотправленные задания Битрикса, по порядку создания."""
         async with self._lock:
@@ -329,7 +422,7 @@ class Storage:
         ]
 
     async def mark_outbox_done(self, ids: Iterable[int], note: str | None = None) -> None:
-        """Отправлено (или заменено более новым снимком — тогда note объясняет почему)."""
+        """Отправлено (или заменено более новым заданием — тогда note объясняет почему)."""
         async with self._tx() as db:
             for i in ids:
                 await db.execute(

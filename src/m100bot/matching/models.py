@@ -51,7 +51,6 @@ class MatchedItem(BaseModel):
     candidates: list[int] = []  # варианты для кнопок при AMBIGUOUS
     over_remaining: bool = False  # объём больше остатка по смете
     remaining: float | None = None  # сколько осталось по смете (для «осталось 12 м»)
-    picked: bool = False  # вариант выбрал мастер кнопкой — после записи запомним как синоним
 
     @property
     def is_ready(self) -> bool:

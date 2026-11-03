@@ -6,6 +6,7 @@ from m100bot.matching.phrase import (
     Part,
     bare_numbers,
     find_quantities,
+    jargon_words,
     split_by_features,
     synonym_key,
 )
@@ -83,3 +84,9 @@ def test_bare_numbers() -> None:
 )
 def test_synonym_key(phrase: str, qty: float | None, key: str) -> None:
     assert synonym_key(phrase, qty) == key
+
+
+def test_jargon_words() -> None:
+    assert jargon_words("проложили Гофру 20-ку") == ["труба", "пвх"]
+    assert jargon_words("гофротруба") == ["труба", "пвх"]
+    assert jargon_words("проложили кабель") == []

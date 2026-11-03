@@ -61,13 +61,11 @@ async def put(storage: Storage, *items: MatchedItem, text: str = "текст"):
 # ─────────────── Выбор варианта ───────────────
 
 
-async def test_pick_resolves_item_and_marks_it_picked(
-    service: ReportService, storage: Storage
-) -> None:
+async def test_pick_resolves_item(service: ReportService, storage: Storage) -> None:
     draft = await put(storage, amb("12 хомутов", 12, [43, 44]))
     after = await service.pick_variant(USER, 0, 44, token=draft.token)
     item = after.items[0]
-    assert (item.status, item.row, item.candidates, item.picked) == (MatchStatus.OK, 44, [], True)
+    assert (item.status, item.row, item.candidates) == (MatchStatus.OK, 44, [])
 
 
 async def test_pick_with_other_unit_asks_quantity_again(
@@ -280,56 +278,6 @@ async def test_confirm_with_only_not_found(service: ReportService, storage: Stor
 async def test_decimal_comma_in_texts(service: ReportService, storage: Storage) -> None:
     await put(storage, ok(28, 0.5))
     assert "— 0,5 кг" in await service.confirm(USER, D)
-
-
-# ─────────────── Синонимы «за кадром» ───────────────
-
-
-def picked(item: MatchedItem) -> MatchedItem:
-    return item.model_copy(update={"picked": True})
-
-
-async def test_only_picked_items_are_learned(
-    service: ReportService, sheets: FakeSheets, storage: Storage
-) -> None:
-    chosen = picked(ok(44, 12).model_copy(update={"phrase": "поставили 12 хомутов"}))
-    await put(storage, ok(17, 15), chosen)
-    await service.confirm(USER, D)
-    await service.drain()
-    assert sheets.added_synonyms == [("хомутов", 44)]  # ни объёма, ни глагола
-
-
-async def test_synonym_failure_does_not_break_confirm(
-    service: ReportService, sheets: FakeSheets, storage: Storage
-) -> None:
-    sheets.synonym_error = RuntimeError("таблица не отвечает")
-    await put(storage, picked(ok(44, 12).model_copy(update={"phrase": "хомутов 12"})))
-    text = await service.confirm(USER, D)
-    await service.drain()
-    assert text.startswith("✅ Записано")  # мастер ничего не заметил
-    assert sheets.cells[(D, 44)] == 12
-
-
-async def test_too_short_key_is_not_learned(
-    service: ReportService, sheets: FakeSheets, storage: Storage
-) -> None:
-    await put(storage, picked(ok(17, 15).model_copy(update={"phrase": "15 м"})))
-    await service.confirm(USER, D)
-    await service.drain()
-    assert sheets.added_synonyms == []
-
-
-async def test_synonyms_are_not_learned_when_writing_fails(
-    service: ReportService, sheets: FakeSheets, storage: Storage
-) -> None:
-    from m100bot.sheets.client import SheetsError
-
-    sheets.write_errors = [SheetsError("Таблица недоступна.")]
-    await put(storage, picked(ok(44, 12).model_copy(update={"phrase": "хомутов 12"})))
-    with pytest.raises(ReportError):
-        await service.confirm(USER, D)
-    await service.drain()
-    assert sheets.added_synonyms == []
 
 
 # ─────────────── /today ───────────────

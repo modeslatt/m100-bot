@@ -88,13 +88,16 @@ async def test_full_flow_through_outbox(make_service, storage: Storage, catalog:
 
     await service.recognize(USER, "медь 6-ка 15 м, кабель 3х2,5 — 56 м")
     await service.confirm(USER, NEW, master="Иван Петров")
-    assert bitrix.calls == []
-    await service.flush_outbox()
+    await service.drain()  # отправка сразу после записи — в фоне
+    assert await storage.pending_outbox() == []
 
-    [(d, master, lines, url)] = bitrix.calls
-    assert (d, master) == (NEW, "Иван Петров")
+    [sent] = bitrix.calls
+    assert (sent.work_date, sent.master) == (NEW, "Иван Петров")
+    lines = sent.lines
     assert len(lines) == 2 and lines[0].endswith("— 15 м") and lines[1].endswith("— 56 м")
-    assert url.startswith("https://docs.google.com/spreadsheets/d/SHEET_ID/edit#gid=1000&range=B17")
+    assert sent.sheet_url.startswith(
+        "https://docs.google.com/spreadsheets/d/SHEET_ID/edit#gid=1000&range=B17"
+    )
 
 
 async def test_recognize_computes_remaining_from_real_sheet(

@@ -97,6 +97,20 @@ def words(text: str) -> list[str]:
     return [w for w in _WORD.findall(normalize_text(text)) if w not in STOPWORDS]
 
 
+# Жаргон, который однозначно называет материал, → слова из названия позиции. Не номера строк:
+# справочник по-прежнему читается из таблицы. Модель на CPU такие правила из промпта
+# соблюдает ненадёжно («гофру» → хомут), поэтому они продублированы кодом.
+JARGON: list[tuple[re.Pattern[str], tuple[str, ...]]] = [
+    (re.compile(r"\bгофр\w*"), ("труба", "пвх")),
+]
+
+
+def jargon_words(text: str) -> list[str]:
+    """«проложили гофру» → ["труба", "пвх"]; жаргона нет → []."""
+    t = normalize_text(text)
+    return [w for rx, name_words in JARGON if rx.search(t) for w in name_words]
+
+
 # ─────────────── Деление слитого упоминания ───────────────
 
 # «20а», «32 ампер», «на 16» — ток; дроби, жаргон и «6-ку» — диаметр; «4х1.5» — сечение

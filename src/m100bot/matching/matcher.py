@@ -32,6 +32,7 @@ from m100bot.matching.normalize import NUMBER_WORDS, normalize_text, normalize_u
 from m100bot.matching.phrase import (
     bare_numbers,
     find_quantities,
+    jargon_words,
     split_by_features,
     synonym_key,
     words,
@@ -229,6 +230,15 @@ def _word_hits(text_words: list[str], pos: Position) -> int:
         elif len(w) >= 2:
             hits += w in name
     return hits
+
+
+def _named_by(name_words: list[str], pos: Position) -> bool:
+    """Название начинается с первого слова («Труба …») и содержит остальные («ПВХ»).
+    Тройник «для ПВХ труб» — не труба ПВХ."""
+    first = next(iter(_name_words(pos.short_name)), "")
+    return first.startswith(name_words[0][:WORD_PREFIX]) and _word_hits(name_words, pos) == len(
+        name_words
+    )
 
 
 def prefer_by_words(text_words: list[str], survivors: list[Position]) -> list[Position]:
@@ -452,7 +462,8 @@ class Matcher:
         checks = feature_checks(pf)
         exclude = {mention.qty} if mention.qty is not None else set()
         numbers = bare_numbers(mention.phrase, exclude)
-        phrase_words = words(mention.phrase)
+        jargon = jargon_words(mention.phrase)
+        phrase_words = words(mention.phrase) + jargon
 
         llm_rows: list[Position] = []
         for row in dict.fromkeys(mention.candidates):
@@ -461,6 +472,11 @@ class Matcher:
                 logger.warning("LLM вернула строку {}, которой нет в справочнике", row)
                 continue
             llm_rows.append(pos)
+        if jargon:
+            # жаргон однозначно называет материал: позиции — по названию, а не от модели
+            named = [p for p in index.catalog.positions if _named_by(jargon, p)]
+            if named:
+                llm_rows = named
 
         pool = list(llm_rows)
         if self.expand_siblings:

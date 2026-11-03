@@ -319,12 +319,3 @@ def parse_synonyms(
             continue
         result[key] = row
     return result, warnings
-
-
-def find_synonym_row(rows: list[list[Any]], phrase: str) -> int | None:
-    """Номер строки листа «Синонимы» с этой фразой (после нормализации) или None."""
-    key = normalize_text(phrase)
-    for i, r in enumerate(rows, start=1):
-        if i > 1 and r and r[0] is not None and normalize_text(str(r[0])) == key:
-            return i
-    return None

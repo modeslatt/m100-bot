@@ -20,7 +20,6 @@ from m100bot.sheets.addressing import (
     extend_sum_formulas,
     extend_sum_requests,
     find_shifted_rows,
-    find_synonym_row,
     insert_date_column_requests,
     parse_synonyms,
     plan_date_column,
@@ -317,14 +316,6 @@ def test_parse_synonyms_problems_are_warnings(catalog: Catalog) -> None:
 def test_parse_synonyms_without_catalog_trusts_rows() -> None:
     synonyms, warnings = parse_synonyms([["a", 17], ["b", 999]])
     assert synonyms == {"a": 17, "b": 999} and warnings == []
-
-
-def test_find_synonym_row() -> None:
-    rows = [["Фраза", "Строка"], ["Шестёрка", 17], ["гофра", 64]]
-    assert find_synonym_row(rows, "ШЕСТЁРКА") == 2
-    assert find_synonym_row(rows, "гофра") == 3
-    assert find_synonym_row(rows, "Фраза") is None  # заголовок — не синоним
-    assert find_synonym_row(rows, "нет такой") is None
 
 
 # ─────────────── Ссылка ───────────────

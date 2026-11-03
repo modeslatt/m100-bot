@@ -32,7 +32,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from m100bot.matching.normalize import normalize_text, parse_number
+from m100bot.matching.normalize import parse_number
 from m100bot.sheets.addressing import (
     SYNONYMS_HEADER,
     CellChange,
@@ -47,7 +47,6 @@ from m100bot.sheets.addressing import (
     extend_sum_formulas,
     extend_sum_requests,
     find_shifted_rows,
-    find_synonym_row,
     insert_date_column_requests,
     parse_synonyms,
     plan_date_column,
@@ -207,21 +206,6 @@ class SheetsClient:
         if not wanted:
             return {}
         return await asyncio.to_thread(self._call, self._read_numbers_once, COL_DONE, wanted)
-
-    async def add_synonym(self, phrase: str, row: int) -> None:
-        """Запомнить фразу мастера → позицию. Такая фраза уже есть — обновить её позицию."""
-        clean = " ".join(phrase.split())
-        if not normalize_text(clean):
-            raise ValueError("пустая фраза синонима")
-        catalog = await self.load_catalog()
-        pos = catalog.by_row(row)
-        if pos is None:
-            raise ValueError(f"строка {row} не является позицией сметы")
-        async with self._lock:
-            try:
-                await asyncio.to_thread(self._call, self._add_synonym_once, clean, pos)
-            finally:
-                self._synonyms = None
 
     def row_link(self, row: int) -> str:
         """Ссылка на строку позиции. gid известен после первого обращения к таблице."""
@@ -422,14 +406,3 @@ class SheetsClient:
         ws = self._synonyms_worksheet()
         rows = ws.get_values(value_render_option=ValueRenderOption.unformatted)
         return [list(r) for r in rows]
-
-    def _add_synonym_once(self, phrase: str, pos: Position) -> None:
-        ws = self._synonyms_worksheet()
-        rows = [list(r) for r in ws.get_values(value_render_option=ValueRenderOption.unformatted)]
-        existing = find_synonym_row(rows, phrase)
-        if existing is not None:
-            ws.update([[pos.row, pos.name]], f"B{existing}:C{existing}", raw=True)
-            logger.info("Синоним «{}» теперь указывает на строку {}", phrase, pos.row)
-        else:
-            ws.append_row([phrase, pos.row, pos.name], table_range="A1")
-            logger.info("Добавлен синоним «{}» → строка {}", phrase, pos.row)
