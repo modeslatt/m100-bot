@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from contextlib import suppress
+from urllib.parse import urlsplit
 
 from aiogram import Bot
 from aiogram.types import BotCommand
@@ -40,6 +41,16 @@ async def main() -> None:
     settings = get_settings()
     logger.remove()
     logger.add(sys.stderr, level=settings.log_level)
+    if settings.log_file is not None:
+        logger.add(
+            settings.log_file,
+            level=settings.log_level,
+            encoding="utf-8",
+            rotation="10 MB",
+            retention=5,
+        )
+    # какая LLM: модель и хост, без ключа и пути (локально — Ollama, на сервере — Groq)
+    logger.info("LLM: {} на {}", settings.llm_model, urlsplit(settings.llm_base_url).netloc or "?")
 
     storage = Storage(settings.db_path)
     await storage.init()

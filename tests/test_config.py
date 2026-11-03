@@ -42,3 +42,9 @@ def test_allowed_user_ids_from_dotenv_file(tmp_path, monkeypatch: pytest.MonkeyP
 def test_timezone_database_is_available() -> None:
     """На Windows базы часовых поясов нет без пакета tzdata — бот не смог бы узнать «сегодня»."""
     assert ZoneInfo(load().timezone).key == "Europe/Minsk"
+
+
+def test_log_file_optional() -> None:
+    assert load().log_file is None
+    assert load(log_file="").log_file is None
+    assert str(load(log_file="data/bot.log").log_file).replace("\\", "/") == "data/bot.log"

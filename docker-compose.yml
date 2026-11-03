@@ -1,0 +1,22 @@
+# Запуск на сервере: docker compose up -d --build
+# Рядом с этим файлом должны лежать .env (из .env.deploy.example) и credentials.json.
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    volumes:
+      # бот читает .env сам — так же, как при локальном запуске
+      - ./.env:/app/.env:ro
+      - ./credentials.json:/app/credentials.json:ro
+      # SQLite (черновики, журнал, очередь Битрикса) и лог переживают пересборку
+      - bot-data:/app/data
+    environment:
+      LOG_FILE: data/bot.log
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot-data:

@@ -60,6 +60,8 @@ class Settings(LlmSettings, SheetsSettings):
     timezone: str = "Europe/Minsk"
     db_path: Path = Path("data/bot.sqlite3")
     log_level: str = "INFO"
+    # Лог ещё и в файл (UTF-8, ротация 10 МБ × 5). Пусто — только в консоль.
+    log_file: Path | None = None
 
     @field_validator("allowed_user_ids", mode="before")
     @classmethod
@@ -67,6 +69,11 @@ class Settings(LlmSettings, SheetsSettings):
         if isinstance(v, str):
             return [int(x) for x in v.replace(" ", "").split(",") if x]
         return v
+
+    @field_validator("log_file", mode="before")
+    @classmethod
+    def _empty_path_to_none(cls, v: object) -> object:
+        return None if v == "" else v
 
     @field_validator("bitrix_entity_type_id", mode="before")
     @classmethod
