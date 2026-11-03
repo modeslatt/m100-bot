@@ -131,7 +131,7 @@ async def test_old_token_is_rejected_by_every_operation(
         service.set_item_qty(USER, 0, 5, token=old.token),
         service.remove_item(USER, 0, token=old.token),
         service.pick_variant(USER, 0, None, token=old.token),
-        service.append(USER, "ещё", token=old.token),
+        service.recognize(USER, "ещё", append=True, token=old.token),
         service.get_draft(USER, token=old.token),
     ):
         with pytest.raises(StaleCardError, match="устарела"):
@@ -211,8 +211,9 @@ async def test_append_adds_to_the_end(
 ) -> None:
     await put(storage, ok(17, 15), text="первый")
     service.matcher = FakeMatcher([ok(44, 10)])
-    draft, added = await service.append(USER, "второй")
-    assert added == 1 and draft is not None
+    understood = await service.recognize(USER, "второй", append=True)
+    draft = await storage.get_draft(USER)
+    assert len(understood.items) == 1 and draft is not None
     assert [i.row for i in draft.items] == [17, 44] and draft.source_text == "первый\nвторой"
 
 
@@ -221,8 +222,31 @@ async def test_append_with_nothing_found_changes_nothing(
 ) -> None:
     before = await put(storage, ok(17, 15))
     service.matcher = FakeMatcher([])
-    draft, added = await service.append(USER, "ничего")
-    assert added == 0 and draft == before
+    understood = await service.recognize(USER, "ничего", append=True)
+    assert understood.items == [] and await storage.get_draft(USER) == before
+
+
+async def test_question_never_touches_draft(
+    service: ReportService, storage: Storage, catalog: Catalog
+) -> None:
+    """«Сколько осталось по …» — только ответ: черновик не меняется ни в каком режиме."""
+    before = await put(storage, ok(17, 15))
+    matcher = FakeMatcher([ok(55, 1)])
+    matcher.intent = "question"
+    service.matcher = matcher
+    for append in (False, True):
+        understood = await service.recognize(USER, "сколько осталось кабеля", append=append)
+        assert understood.intent == "question"
+        assert await storage.get_draft(USER) == before
+
+
+async def test_remaining_lines(service: ReportService, sheets: FakeSheets) -> None:
+    sheets.done = {55: 112.0, 48: 20.0}
+    lines = await service.remaining([55, 48, 4])  # 4 — не позиция: пропускается
+    assert [(ln.row, ln.planned, ln.done, ln.left, ln.unit) for ln in lines] == [
+        (55, 182.0, 112.0, 70.0, "м"),
+        (48, 18.0, 20.0, -2.0, "шт"),
+    ]
 
 
 async def test_cancel_deletes_draft_only(

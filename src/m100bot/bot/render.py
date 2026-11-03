@@ -12,7 +12,8 @@ from datetime import date
 from typing import Literal
 
 from m100bot.matching.models import MatchedItem, MatchStatus
-from m100bot.services.report import TodayLine, fmt_qty
+from m100bot.matching.normalize import NUMBER_WORDS
+from m100bot.services.report import RemainingLine, TodayLine, fmt_qty
 from m100bot.sheets.catalog import Catalog, Position
 
 HELP = (
@@ -29,6 +30,10 @@ NOTHING_FOUND = (
 NOTHING_ADDED = "Не нашёл новых работ. Напишите ещё раз или нажмите «Назад»."
 VOICE_STUB = "Голосовые не настроены. Пришлите отчёт текстом."
 LISTENING = "Распознаю голос…"
+TRUNCATED = (
+    "⚠️ Сообщение длинное — проверьте, все ли работы попали в отчёт. "
+    "Недостающие пришлите отдельным сообщением."
+)
 VOICE_TOO_LONG = "Голосовое длиннее 5 минут. Разбейте на части или пришлите текстом."
 VOICE_EMPTY = "Не расслышал. Повторите голосовое или пришлите текстом."
 VOICE_FAILED = "Не удалось распознать голосовое. Попробуйте ещё раз или пришлите текстом."
@@ -88,22 +93,6 @@ def parse_qty(text: str) -> float | None:
     return words_to_number(text)
 
 
-# Числа словами — так их часто записывает распознавание голоса.
-# Значение и «разряд»: разряды идут строго по убыванию («двадцать пять», а не «пять двадцать»).
-_NUMBER_WORDS: dict[str, tuple[float, int]] = {
-    "ноль": (0, 1),
-    "один": (1, 1), "одна": (1, 1), "одно": (1, 1), "одну": (1, 1),
-    "два": (2, 1), "две": (2, 1), "три": (3, 1), "четыре": (4, 1), "пять": (5, 1),
-    "шесть": (6, 1), "семь": (7, 1), "восемь": (8, 1), "девять": (9, 1),
-    "десять": (10, 2), "одиннадцать": (11, 2), "двенадцать": (12, 2), "тринадцать": (13, 2),
-    "четырнадцать": (14, 2), "пятнадцать": (15, 2), "шестнадцать": (16, 2),
-    "семнадцать": (17, 2), "восемнадцать": (18, 2), "девятнадцать": (19, 2),
-    "двадцать": (20, 2), "тридцать": (30, 2), "сорок": (40, 2), "пятьдесят": (50, 2),
-    "шестьдесят": (60, 2), "семьдесят": (70, 2), "восемьдесят": (80, 2), "девяносто": (90, 2),
-    "сто": (100, 3), "двести": (200, 3), "триста": (300, 3), "четыреста": (400, 3),
-    "пятьсот": (500, 3), "шестьсот": (600, 3), "семьсот": (700, 3), "восемьсот": (800, 3),
-    "девятьсот": (900, 3),
-}  # fmt: skip
 # Единицы после числа («пятнадцать метров») и слова-связки — не мешают
 _FILLER_PREFIXES = ("метр", "м", "шт", "штук", "кг", "килограм", "сист", "компл", "ровно")
 
@@ -128,9 +117,9 @@ def words_to_number(text: str) -> float | None:
         return None
     total, last_rank = 0.0, 4
     for token in tokens:
-        if token not in _NUMBER_WORDS:
+        if token not in NUMBER_WORDS:
             return None
-        value, rank = _NUMBER_WORDS[token]
+        value, rank = NUMBER_WORDS[token]
         if rank >= last_rank:
             return None
         total += value
@@ -317,3 +306,31 @@ def today_item_text(line: TodayLine) -> str:
         f"{line.name} — {fmt_qty(line.qty)} {line.unit}.\n"
         f"Пришлите новый объём числом ({line.unit}) или очистите."
     ).replace(" .", ".")
+
+
+# ─────────────── «Сколько осталось по …» ───────────────
+
+QUESTION_NOT_FOUND = (
+    "Не нашёл позицию. Спросите точнее, например: «сколько осталось по кабелю 3х2,5?»"
+)
+
+
+def remaining_text(lines: list[RemainingLine]) -> str:
+    """«Кабель … 3х2,5: по смете 182 м, выполнено 112 м, осталось 70 м.» — по строке на позицию."""
+    out = []
+    for line in lines:
+        u = line.unit
+        plan, done = fmt_qty(line.planned), fmt_qty(line.done)
+        head = f"{line.name}:\nПо смете {plan} {u}, выполнено {done} {u}"
+        if line.left >= 0:
+            out.append(f"{head}, осталось {fmt_qty(line.left)} {u}.")
+        else:
+            out.append(f"{head} — сверх сметы {fmt_qty(-line.left)} {u}.")
+    return "\n\n".join(out)
+
+
+def remaining_question(item: MatchedItem, catalog: Catalog) -> tuple[str, list[tuple[int, str]]]:
+    """Вопрос об остатке подходит к нескольким позициям: «По какой позиции?» + список."""
+    options = choice_options(item, catalog)
+    listing = "\n".join(f"{k}. {name}" for k, (_, name) in enumerate(options, start=1))
+    return f"«{item.phrase}» — по какой позиции?\n\n{listing}", options

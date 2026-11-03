@@ -20,6 +20,7 @@ from m100bot.bot import render
 from m100bot.bot.keyboards import (
     Act,
     CardAction,
+    Left,
     Today,
     TodayAction,
     back_keyboard,
@@ -27,6 +28,7 @@ from m100bot.bot.keyboards import (
     edit_pick_keyboard,
     item_edit_keyboard,
     qty_question_keyboard,
+    remaining_choice_keyboard,
     review_keyboard,
     sheet_link_keyboard,
     stale_draft_keyboard,
@@ -36,6 +38,7 @@ from m100bot.bot.keyboards import (
 )
 from m100bot.bot.states import ReportFlow
 from m100bot.matching.llm import LlmError
+from m100bot.matching.models import MatchedItem
 from m100bot.services.report import ReportError, ReportService, StaleCardError
 from m100bot.sheets.client import SheetsError
 from m100bot.storage.db import Draft
@@ -254,13 +257,15 @@ async def recognize_into_card(
     token: str | None = None,
 ) -> None:
     """Распознать текст (дописать в черновик или начать новый) и показать карточку на месте
-    placeholder_id. Работ не нашлось — прежний черновик и карточка остаются как были."""
+    placeholder_id. Работ не нашлось — прежний черновик и карточка остаются как были.
+    Это вопрос об остатке — ответить; черновик, карточка и режим не меняются."""
     old = await state.get_data()
     try:
-        if append:
-            _, found = await service.append(uid, text, token=token)
-        else:
-            found = len(await service.recognize(uid, text))
+        understood = await service.recognize(uid, text, append=append, token=token)
+        if understood.intent == "question":
+            await answer_question(bot, chat_id, service, placeholder_id, understood.items)
+            return
+        found = bool(understood.items)
     except StaleCardError:
         raise  # кнопка со старой карточки — разберётся guarded()
     except USER_ERRORS as e:
@@ -278,6 +283,8 @@ async def recognize_into_card(
     await delete_quietly(bot, chat_id, old.get("question_id"))
     await state.clear()
     await refresh(bot, chat_id, service, state, uid, card_id=placeholder_id)
+    if understood.truncated:
+        await bot.send_message(chat_id, render.TRUNCATED)
 
 
 async def ask_about_stale_draft(
@@ -293,6 +300,50 @@ async def ask_about_stale_draft(
     await state.set_state(None)
     await state.update_data(pending_text=text)
     await message.answer(question, reply_markup=stale_draft_keyboard(draft.token))
+
+
+# ─────────────── «Сколько осталось по …» ───────────────
+
+
+async def answer_question(
+    bot: Bot, chat_id: int, service: ReportService, answer_id: int, items: list[MatchedItem]
+) -> None:
+    """Ответ на вопрос об остатке на месте answer_id; неоднозначная позиция — список и номера.
+
+    Только читает таблицу: черновик и режим не трогаем.
+    """
+    rows = [i.row for i in items if i.row is not None]
+    unclear = [i for i in items if i.row is None and len(i.candidates) >= 2]
+    if not rows and not unclear:
+        await edit_or_send(bot, chat_id, answer_id, render.QUESTION_NOT_FOUND)
+        return
+    if rows:
+        lines = await service.remaining(rows)
+        link = sheet_link_keyboard(service.table_link(rows[0]))
+        await edit_or_send(bot, chat_id, answer_id, render.remaining_text(lines), link)
+    catalog = await service.catalog()
+    for n, item in enumerate(unclear):
+        text, options = render.remaining_question(item, catalog)
+        keyboard = remaining_choice_keyboard(options)
+        if n == 0 and not rows:  # первый вопрос — на месте «Разбираю…»
+            await edit_or_send(bot, chat_id, answer_id, text, keyboard)
+        else:
+            await bot.send_message(chat_id, text, reply_markup=keyboard)
+
+
+async def on_left(
+    call: CallbackQuery, callback_data: Left, bot: Bot, service: ReportService
+) -> None:
+    """Выбрана позиция в вопросе «по какой позиции?» — ответ на месте вопроса."""
+
+    async def run() -> None:
+        assert call.message is not None
+        lines = await service.remaining([callback_data.r])
+        link = sheet_link_keyboard(service.table_link(callback_data.r))
+        text = render.remaining_text(lines)
+        await edit_or_send(bot, call.message.chat.id, call.message.message_id, text, link)
+
+    await guarded(call, bot, run)
 
 
 # ─────────────── Ответы в режимах ───────────────
@@ -347,7 +398,11 @@ async def add_text(
     data = await state.get_data()
     await bot.send_chat_action(chat_id, "typing")
     try:
-        _, added = await service.append(uid, text, token=data.get("token"))
+        understood = await service.recognize(uid, text, append=True, token=data.get("token"))
+        if understood.intent == "question":  # спросил остаток — отвечаем, режим не меняем
+            answer = await message.answer(render.THINKING)
+            await answer_question(bot, chat_id, service, answer.message_id, understood.items)
+            return
     except StaleCardError as e:
         await state.clear()
         await message.answer(str(e))
@@ -355,11 +410,13 @@ async def add_text(
     except USER_ERRORS as e:
         await message.answer(str(e))
         return
-    if added == 0:
+    if not understood.items:
         await message.answer(render.NOTHING_ADDED)
         return
     await state.set_state(None)
     await refresh(bot, chat_id, service, state, uid, card_id=data.get("card_id"))
+    if understood.truncated:
+        await bot.send_message(chat_id, render.TRUNCATED)
 
 
 async def correct_today_qty(
@@ -727,4 +784,5 @@ def build_router() -> Router:
 
     r.callback_query.register(on_act, Act.filter())
     r.callback_query.register(on_today_act, Today.filter())
+    r.callback_query.register(on_left, Left.filter())
     return r

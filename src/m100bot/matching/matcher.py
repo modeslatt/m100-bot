@@ -26,8 +26,9 @@ from typing import Protocol
 from loguru import logger
 
 from m100bot.matching.features import PhraseFeatures, extract_phrase_features
-from m100bot.matching.models import LlmMention, LlmResponse, MatchedItem, MatchStatus
-from m100bot.matching.normalize import normalize_text, normalize_unit
+from m100bot.matching.llm import MAX_MENTIONS
+from m100bot.matching.models import LlmMention, LlmResponse, MatchedItem, MatchStatus, Understood
+from m100bot.matching.normalize import NUMBER_WORDS, normalize_text, normalize_unit
 from m100bot.matching.phrase import (
     bare_numbers,
     find_quantities,
@@ -309,14 +310,33 @@ class Matcher:
 
     # ── сообщение целиком ──
 
-    async def match(
+    async def understand(
         self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
-    ) -> list[MatchedItem]:
-        """Сообщение мастера → позиции на подтверждение. Ошибки LLM (LlmError) — наверх."""
+    ) -> Understood:
+        """Сообщение мастера → отчёт (позиции на подтверждение) или вопрос об остатке
+        (позиции, о которых спрашивают). Ошибки LLM (LlmError) — наверх."""
         if not normalize_text(text):
-            return []
+            return Understood("report", [])
         index = _Index.build(catalog, synonyms)
-        mentions = await self._extract_complete(text, catalog)
+        response = await self._extract_complete(text, catalog)
+        intent = response.intent
+        if intent == "question" and find_quantities(text):
+            # «проложили 15 м, сколько осталось?» — есть сделанная работа, значит это отчёт
+            logger.info("LLM сочла вопросом, но в сообщении есть объёмы — это отчёт")
+            intent = "report"
+        mentions = _collapse_loops(response.mentions)
+        truncated = len(mentions) >= MAX_MENTIONS
+        if truncated:
+            logger.warning(
+                "LLM вернула {} упоминаний — предел, часть могла не влезть", MAX_MENTIONS
+            )
+        if intent == "report":
+            mentions = [_drop_invented_qty(m, text) for m in mentions]
+        if intent == "question":
+            # о чём спрашивают — важна только позиция: объём не нужен и не должен влиять
+            mentions = [m.model_copy(update={"qty": None, "unit": None}) for m in mentions]
+            if not mentions:  # «сколько осталось?» без позиции
+                mentions = [LlmMention(phrase=text, qty=None, unit=None, candidates=[])]
         message_words = words(text)
 
         items = [
@@ -325,14 +345,23 @@ class Matcher:
             for part in _split(mention)
         ]
         items = self._resolve_references(items, catalog)
+        if intent == "question":
+            items = [_too_vague(i) for i in items]
         logger.info(
-            "match: {} позиций: {}",
+            "match ({}): {} позиций: {}",
+            intent,
             len(items),
             ", ".join(f"{i.status}:{i.row or i.candidates}" for i in items),
         )
-        return items
+        return Understood(intent, items, truncated)
 
-    async def _extract_complete(self, text: str, catalog: Catalog) -> list[LlmMention]:
+    async def match(
+        self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
+    ) -> list[MatchedItem]:
+        """Только позиции (без намерения) — для тестов и скриптов."""
+        return (await self.understand(text, catalog, synonyms)).items
+
+    async def _extract_complete(self, text: str, catalog: Catalog) -> LlmResponse:
         """Вызов LLM + проверка, что ни один «объём с единицей» из сообщения не потерян.
 
         Если потерян — один раз переспрашиваем с подсказкой и берём более полный ответ.
@@ -340,7 +369,7 @@ class Matcher:
         response = await self.llm.extract(text, catalog)
         missing = _missing_quantities(text, response.mentions)
         if not missing:
-            return response.mentions
+            return response
         logger.warning("LLM пропустила объёмы {} — переспрашиваю", missing)
         hint = ", ".join(f"«{q}»" for q in missing)
         retry_text = (
@@ -349,8 +378,8 @@ class Matcher:
         )
         retry = await self.llm.extract(retry_text, catalog)
         if len(_missing_quantities(text, retry.mentions)) < len(missing):
-            return retry.mentions
-        return response.mentions
+            return retry
+        return response
 
     def _resolve_references(self, items: list[MatchedItem], catalog: Catalog) -> list[MatchedItem]:
         """«изоляцию на них столько же» → по позиции на каждый диаметр из предыдущих строк."""
@@ -464,6 +493,68 @@ class Matcher:
 
 
 # ─────────────── Вспомогательное ───────────────
+
+LOOP_REPEATS = 3  # столько одинаковых упоминаний подряд — это «зацикливание» модели
+
+
+def _collapse_loops(mentions: list[LlmMention]) -> list[LlmMention]:
+    """Модель иногда повторяет одно упоминание до лимита токенов. Серия из LOOP_REPEATS и
+    более одинаковых подряд — одно упоминание; одиночный повтор («хомуты 10 … хомуты 10»)
+    мог сказать и мастер, его не трогаем."""
+    out: list[LlmMention] = []
+    run: list[LlmMention] = []
+    for m in [*mentions, None]:
+        if (
+            m is not None
+            and run
+            and m.model_dump(exclude={"note"}) == run[0].model_dump(exclude={"note"})
+        ):
+            run.append(m)
+            continue
+        if len(run) >= LOOP_REPEATS:
+            logger.warning("LLM повторила «{}» {} раз — оставляю одно", run[0].phrase, len(run))
+            out.append(run[0])
+        else:
+            out.extend(run)
+        run = [m] if m is not None else []
+    return out
+
+
+_DIGITS = re.compile(r"(?<![\d.])\d+(?:\.\d+)?")
+
+
+def _qty_in_text(qty: float, text: str) -> bool:
+    """Объём, который назвала LLM, есть в сообщении: цифрами, словами («двадцать пять»,
+    «полтора») или это 1 (единственное число в «шт» — согласованное правило)."""
+    if math.isclose(qty, 1):
+        return True
+    t = normalize_text(text)
+    if any(math.isclose(float(x), qty) for x in _DIGITS.findall(t)):
+        return True
+    return any(
+        w in NUMBER_WORDS or w.startswith(("полтор", "половин")) for w in re.findall(r"[а-я]+", t)
+    )
+
+
+def _drop_invented_qty(mention: LlmMention, text: str) -> LlmMention:
+    """LLM назвала объём, которого мастер не говорил («медь 6-ку тянули» → 15 м) — не верим:
+    бот спросит «сколько?». Выдуманный объём опаснее лишнего вопроса."""
+    if mention.qty is None or _qty_in_text(mention.qty, text):
+        return mention
+    logger.warning("LLM назвала объём {}, которого нет в сообщении — спрошу у мастера", mention.qty)
+    return mention.model_copy(update={"qty": None})
+
+
+# Больше вариантов в вопросе об остатке — позиция по сути не названа («сколько осталось?»)
+MAX_QUESTION_CHOICES = 8
+
+
+def _too_vague(item: MatchedItem) -> MatchedItem:
+    """Вопрос подходит к слишком многим позициям — попросить спросить точнее, а не
+    показывать список из десятков строк."""
+    if item.status == MatchStatus.AMBIGUOUS and len(item.candidates) > MAX_QUESTION_CHOICES:
+        return item.model_copy(update={"status": MatchStatus.NOT_FOUND, "candidates": []})
+    return item
 
 
 def _same_size_positions(

@@ -1,6 +1,8 @@
 """Модели результата сопоставления."""
 
+from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -26,7 +28,15 @@ class LlmMention(BaseModel):
     )
 
 
+# report — мастер сообщает о сделанной работе; question — спрашивает остаток по смете
+Intent = Literal["report", "question"]
+
+
 class LlmResponse(BaseModel):
+    intent: Intent = Field(
+        default="report",
+        description="report — отчёт о сделанной работе; question — вопрос об остатке по смете",
+    )
     mentions: list[LlmMention]
 
 
@@ -57,3 +67,12 @@ class MatchedItem(BaseModel):
         """Отметить остаток по смете и превышение его объёмом (⚠️ в карточке)."""
         over = self.qty is not None and left is not None and self.qty > left + 1e-9
         return self.model_copy(update={"remaining": left, "over_remaining": over})
+
+
+@dataclass(frozen=True)
+class Understood:
+    """Что хотел мастер и о каких позициях речь."""
+
+    intent: Intent
+    items: list[MatchedItem]
+    truncated: bool = False  # LLM вернула предельное число упоминаний — часть могла не влезть

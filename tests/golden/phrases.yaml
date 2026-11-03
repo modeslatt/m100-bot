@@ -14,6 +14,12 @@
 #     работа («кабель на скобах») — в строку работы; парные строки работ (68–71) не дописываем;
 #   - без явного материала («шестёрка», «девятка») — ambiguous по всем позициям с этим размером.
 #
+# intent (по умолчанию report) — что хотел мастер:
+#   report   — отчёт о сделанной работе (все фразы выше раздела «Вопросы»);
+#   question — вопрос «сколько осталось по …». Позиция без объёма записывается как
+#              {status: clarify, row: N} — «позиция понятна, объём не назван».
+#   Сообщение с объёмом сделанной работы — отчёт, даже если в нём есть вопрос (2026-11-03).
+#
 # Порядок упоминаний в expected не важен.
 # ВАЖНО: не менять expected ради прохождения теста. Спорный эталон — обсудить и поправить осознанно.
 
@@ -352,3 +358,58 @@
   expected:
     - {row: 34, qty: 8}
     - {status: not_found}
+
+# ───────────── Вопросы «сколько осталось» (согласовано 2026-11-03) ─────────────
+# Фразы придумал Claude: проверяют работу функции, а не точность на живой речи.
+
+- id: q-01
+  tags: [question]
+  intent: question
+  text: "сколько осталось по кабелю 3х2,5?"
+  expected: [{status: clarify, row: 55}]
+
+- id: q-02
+  tags: [question]
+  intent: question
+  text: "сколько ещё меди шестёрки тянуть"
+  expected: [{status: clarify, row: 17}]
+
+- id: q-03
+  tags: [question, ambiguous]
+  intent: question
+  text: "остаток по хомутам"
+  expected: [{status: ambiguous, candidates: [43, 44]}]
+
+- id: q-04
+  tags: [question]
+  intent: question
+  text: "сколько осталось автоматов на 16"
+  expected: [{status: clarify, row: 61}]
+
+- id: q-05
+  tags: [question, ambiguous]
+  intent: question
+  text: "сколько гофры осталось"
+  expected: [{status: ambiguous, candidates: [64, 65]}]
+
+- id: q-06
+  tags: [question]
+  intent: question
+  text: "какой остаток по изоляции на девятку"
+  expected: [{status: clarify, row: 21}]
+
+- id: q-07
+  tags: [question, not_found]
+  intent: question
+  text: "сколько осталось"
+  expected: [{status: not_found}]   # позиция не названа
+
+- id: q-08
+  tags: [question, report]
+  text: "проложили 15 м меди 6-ки, сколько осталось?"
+  expected: [{row: 17, qty: 15}]   # есть сделанная работа — это отчёт
+
+- id: q-09
+  tags: [question, report]
+  text: "сколько метров кабеля 3х1,5 проложили — 30"
+  expected: [{row: 56, qty: 30}]   # «сколько» про сделанное — отчёт

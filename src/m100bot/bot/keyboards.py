@@ -131,3 +131,19 @@ def today_item_keyboard(row: int) -> InlineKeyboardMarkup:
     kb.button(text="Назад", callback_data=Today(a="back"))
     kb.adjust(2)
     return kb.as_markup()
+
+
+class Left(CallbackData, prefix="l"):
+    """«Сколько осталось» по выбранной строке. Только читает таблицу — отпечаток не нужен."""
+
+    r: int  # строка таблицы
+
+
+def remaining_choice_keyboard(options: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    """Номера позиций для вопроса об остатке (полные названия — в тексте)."""
+    kb = InlineKeyboardBuilder()
+    for n, (row, _) in enumerate(options, start=1):
+        kb.button(text=str(n), callback_data=Left(r=row))
+    k = len(options)
+    kb.adjust(*([5] * (k // 5)), *([k % 5] if k % 5 else []))
+    return kb.as_markup()

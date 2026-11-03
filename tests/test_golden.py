@@ -38,6 +38,7 @@ def test_integrity_rows_exist(case: dict, catalog: Catalog) -> None:
             assert "row" in exp and "qty" in exp
         if status == "ambiguous":
             assert len(exp["candidates"]) >= 2
+    assert case.get("intent", "report") in ("report", "question")
 
 
 # ─────────────── Точность сопоставления (нужна Ollama или другой LLM) ───────────────
@@ -83,10 +84,7 @@ def matcher(catalog: Catalog):
 @pytest.mark.asyncio(loop_scope="module")  # один loop на модуль: HTTP-клиент matcher'а общий
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
 async def test_match(case: dict, matcher, catalog: Catalog) -> None:
-    try:
-        items = await matcher.match(case["text"], catalog)
-    except NotImplementedError:
-        pytest.skip("Matcher.match ещё не реализован")
-    got = Counter(_key(i) for i in items)
-    expected = Counter(_exp_key(e) for e in case["expected"])
+    understood = await matcher.understand(case["text"], catalog)
+    got = (understood.intent, Counter(_key(i) for i in understood.items))
+    expected = (case.get("intent", "report"), Counter(_exp_key(e) for e in case["expected"]))
     assert got == expected, f"\nфраза: {case['text']}\nожидали: {expected}\nполучили: {got}"

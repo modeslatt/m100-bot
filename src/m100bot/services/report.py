@@ -29,7 +29,7 @@ from loguru import logger
 
 from m100bot.matching.llm import LlmError
 from m100bot.matching.matcher import resolve_position
-from m100bot.matching.models import MatchedItem, MatchStatus
+from m100bot.matching.models import MatchedItem, MatchStatus, Understood
 from m100bot.matching.phrase import synonym_key
 from m100bot.sheets.addressing import CellChange, Mode
 from m100bot.sheets.catalog import Catalog, Position
@@ -72,9 +72,9 @@ class BitrixLike(Protocol):
 
 
 class MatcherLike(Protocol):
-    async def match(
+    async def understand(
         self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
-    ) -> list[MatchedItem]: ...
+    ) -> Understood: ...
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,21 @@ class FlushResult:
     failed: int = 0  # не получилось, повторим позже
     waiting: int = 0  # ещё ждёт паузы перед повтором
     superseded: int = 0  # заменено более новым снимком того же дня
+
+
+@dataclass(frozen=True)
+class RemainingLine:
+    """Ответ «сколько осталось» по одной позиции."""
+
+    row: int
+    name: str
+    unit: str
+    planned: float  # по смете (колонка D)
+    done: float  # выполнено (колонка I)
+
+    @property
+    def left(self) -> float:
+        return round(self.planned - self.done, 6)
 
 
 @dataclass(frozen=True)
@@ -167,32 +182,73 @@ class ReportService:
 
     # ─────────────── Распознавание ───────────────
 
-    async def recognize(self, user_id: int, text: str) -> list[MatchedItem]:
-        """Текст мастера → позиции на подтверждение; результат сохраняется как черновик.
+    async def recognize(
+        self, user_id: int, text: str, *, append: bool = False, token: str | None = None
+    ) -> Understood:
+        """Сообщение мастера → отчёт или вопрос об остатке.
 
-        Пустой результат черновик не трогает. Ошибки справочника (`SheetsError`) и
+        Отчёт: позиции сохраняются в черновик — новый (прежний заменяется) или, при append,
+        дописываются в конец текущего (token — проверка, что карточка не устарела).
+        Вопрос: черновик не трогаем, позиции нужны только для ответа.
+        Пустой отчёт черновик не трогает. Ошибки справочника (`SheetsError`) и
         LLM (`LlmError`) пробрасываются: их тексты уже понятны мастеру.
         """
         async with self._user_locks[user_id]:
-            items = await self._match(text)
-            if items:
-                await self.storage.save_draft(user_id, text, items)
-            return items
+            draft = None
+            if append:
+                draft = (
+                    await self._load(user_id, token)
+                    if token
+                    else await self.storage.get_draft(user_id)
+                )
+            understood = await self._understand(text)
+            if understood.intent == "question" or not understood.items:
+                return understood
+            items = (draft.items if draft else []) + understood.items
+            source = f"{draft.source_text}\n{text}" if draft else text
+            await self.storage.save_draft(user_id, source, items)
+            return understood
 
-    async def _match(self, text: str) -> list[MatchedItem]:
-        """Распознать по свежему справочнику и отметить превышение остатка по смете."""
+    async def _understand(self, text: str) -> Understood:
+        """Распознать по свежему справочнику; в отчёте отметить превышение остатка по смете."""
         catalog = await self.sheets.load_catalog()
         synonyms = await self._synonyms()
         try:
             async with asyncio.timeout(self._recognize_budget_s):
-                items = await self.matcher.match(text, catalog, synonyms)
+                understood = await self.matcher.understand(text, catalog, synonyms)
         except TimeoutError as e:
             logger.error("Распознавание не уложилось в {:.0f} с", self._recognize_budget_s)
             raise LlmError("Распознавание заняло слишком много времени. Попробуйте позже.") from e
+        if understood.intent == "question":
+            return understood
         remaining = await self._remaining_map(catalog)
         if remaining is None:
-            return items
-        return [i.with_remaining(remaining.get(i.row)) if i.row is not None else i for i in items]
+            return understood
+        items = [
+            i.with_remaining(remaining.get(i.row)) if i.row is not None else i
+            for i in understood.items
+        ]
+        return Understood(understood.intent, items, understood.truncated)
+
+    async def remaining(self, rows: Iterable[int]) -> list[RemainingLine]:
+        """План, выполнено и остаток по строкам — для ответа «сколько осталось по …».
+
+        «Выполнено» читается из таблицы заново (колонка I), без кэша: сегодняшние записи
+        уже учтены. Сбой таблицы — ReportError с текстом для мастера.
+        """
+        catalog = await self._catalog()
+        wanted = [r for r in dict.fromkeys(rows) if catalog.by_row(r) is not None]
+        try:
+            done = await self.sheets.read_done(wanted)
+        except SheetsError as e:
+            raise ReportError(f"⚠️ {e}") from e
+        lines = []
+        for row in wanted:
+            pos = catalog.by_row(row)
+            assert pos is not None
+            done_qty = done.get(row, 0.0)
+            lines.append(RemainingLine(row, pos.short_name, pos.unit, pos.planned, done_qty))
+        return lines
 
     async def _synonyms(self) -> dict[str, int]:
         """Синонимы необязательны: без них бот работает, просто чаще переспрашивает."""
@@ -296,25 +352,6 @@ class ReportService:
                 return None
             await self.storage.save_draft(user_id, draft.source_text, items)
             return await self.storage.get_draft(user_id)
-
-    async def append(
-        self, user_id: int, text: str, *, token: str | None = None
-    ) -> tuple[Draft | None, int]:
-        """«Добавить»: распознать ещё текст и дописать позиции в конец.
-
-        Возвращает (черновик, сколько позиций добавлено).
-        """
-        async with self._user_locks[user_id]:
-            draft = (
-                await self._load(user_id, token) if token else await self.storage.get_draft(user_id)
-            )
-            new_items = await self._match(text)
-            if not new_items:
-                return draft, 0
-            items = (draft.items if draft else []) + new_items
-            source = f"{draft.source_text}\n{text}" if draft else text
-            await self.storage.save_draft(user_id, source, items)
-            return await self.storage.get_draft(user_id), len(new_items)
 
     async def cancel(self, user_id: int) -> None:
         async with self._user_locks[user_id]:

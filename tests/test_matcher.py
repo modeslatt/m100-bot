@@ -232,3 +232,94 @@ def test_with_remaining_marks_over(qty: float | None, left: float | None, over: 
     item = MatchedItem(phrase="…", qty=qty, unit="м", status=MatchStatus.OK, row=17)
     marked = item.with_remaining(left)
     assert (marked.over_remaining, marked.remaining) == (over, left)
+
+
+# ─────────────── Вопрос «сколько осталось» ───────────────
+
+
+class QuestionLlm(FakeLlm):
+    async def extract(self, text: str, catalog: Catalog) -> LlmResponse:
+        self.calls += 1
+        return LlmResponse(intent="question", mentions=self.mentions)
+
+
+async def test_question_keeps_position_and_drops_quantity(catalog: Catalog) -> None:
+    """В вопросе объём не нужен: «автоматов на 16» — это позиция, а не «1 шт»."""
+    llm = QuestionLlm(m("автоматов на 16", [61, 62, 63], 1, "шт"))
+    understood = await Matcher(llm).understand("сколько осталось автоматов на 16", catalog)
+    assert understood.intent == "question"
+    assert [(i.status, i.row, i.qty) for i in understood.items] == [("clarify", 61, None)]
+
+
+async def test_question_without_position_is_not_found(catalog: Catalog) -> None:
+    understood = await Matcher(QuestionLlm()).understand("сколько осталось?", catalog)
+    assert understood.intent == "question"
+    assert [i.status for i in understood.items] == ["not_found"]
+
+
+async def test_question_with_done_volume_is_a_report(catalog: Catalog) -> None:
+    """«проложили 15 м, сколько осталось?» — есть сделанная работа: это отчёт."""
+    llm = QuestionLlm(m("проложили 15 м меди 6-ки", [17], 15, "м"))
+    understood = await Matcher(llm).understand(
+        "проложили 15 м меди 6-ки, сколько осталось?", catalog
+    )
+    assert understood.intent == "report"
+    assert [(i.status, i.row, i.qty) for i in understood.items] == [("ok", 17, 15)]
+
+
+async def test_report_is_default_intent(catalog: Catalog) -> None:
+    understood = await Matcher(FakeLlm(m("медь 6-ка 15 м", [17], 15, "м"))).understand(
+        "медь 6-ка 15 м", catalog
+    )
+    assert understood.intent == "report"
+
+
+async def test_vague_question_is_not_found(catalog: Catalog) -> None:
+    """«сколько осталось?» — LLM перечислила полсметы: позиция по сути не названа."""
+    rows = [p.row for p in catalog.positions][:20]
+    understood = await Matcher(QuestionLlm(m("сколько осталось", rows, None))).understand(
+        "сколько осталось", catalog
+    )
+    assert [i.status for i in understood.items] == ["not_found"]
+
+
+@pytest.mark.parametrize(
+    ("text", "qty", "kept"),
+    [
+        ("медь 6-ку тянули", 15, None),  # 15 нигде нет — LLM выдумала
+        ("медь 6-ку тянули 15", 15, 15),
+        ("медь шестёрку двадцать пять метров", 25, 25),  # число словами
+        ("кабель полторашку полтора метра", 1.5, 1.5),
+        ("поставили автомат", 1, 1),  # «шт» в единственном числе — 1 по правилу
+    ],
+)
+async def test_invented_quantity_is_dropped(
+    catalog: Catalog, text: str, qty: float, kept: float | None
+) -> None:
+    llm = FakeLlm(m(text, [17], qty, "м"))
+    [item] = await Matcher(llm).match(text, catalog)
+    assert item.qty == kept
+
+
+async def test_looped_mentions_are_collapsed(catalog: Catalog) -> None:
+    """Модель повторила одно упоминание много раз подряд — это одна позиция."""
+    looped = [m("кассету 12-ю смонтировали", [11, 12], 1, "шт") for _ in range(7)]
+    items = await Matcher(FakeLlm(*looped)).match("кассету 12-ю смонтировали", catalog)
+    assert len(items) == 1
+
+
+async def test_single_repeat_is_kept(catalog: Catalog) -> None:
+    """Два одинаковых подряд мог сказать мастер — не схлопываем."""
+    twice = [m("хомуты 10 шт", [44], 10, "шт") for _ in range(2)]
+    items = await Matcher(FakeLlm(*twice)).match("хомуты 10 шт, хомуты 10 шт", catalog)
+    assert len(items) == 2
+
+
+async def test_mention_limit_is_reported_as_truncated(catalog: Catalog) -> None:
+    from m100bot.matching.llm import MAX_MENTIONS
+
+    many = [m(f"позиция {n} 1 шт", [61], 1, "шт") for n in range(MAX_MENTIONS)]
+    understood = await Matcher(FakeLlm(*many)).understand("длинный отчёт", catalog)
+    assert understood.truncated
+    short = await Matcher(FakeLlm(*many[:3])).understand("короткий отчёт", catalog)
+    assert not short.truncated

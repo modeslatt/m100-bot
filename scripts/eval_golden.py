@@ -71,13 +71,16 @@ async def main() -> int:
     started_all = time.perf_counter()
     for c in cases:
         exp = Counter(exp_key(e) for e in c["expected"])
+        exp_intent = c.get("intent", "report")
         t0 = time.perf_counter()
         try:
-            got = Counter(got_key(i) for i in await matcher.match(c["text"], catalog))
-            got_s = fmt(got)
+            understood = await matcher.understand(c["text"], catalog)
+            got = Counter(got_key(i) for i in understood.items)
+            got_intent = understood.intent
+            got_s = fmt(got) + ("" if got_intent == exp_intent else f" [{got_intent}]")
         except LlmError as e:
-            got, got_s = Counter(), f"ошибка LLM: {e}"
-        ok = got == exp
+            got, got_intent, got_s = Counter(), "", f"ошибка LLM: {e}"
+        ok = got == exp and got_intent == exp_intent
         passed += ok
         dt = time.perf_counter() - t0
         print(f"| {c['id']} | {fmt(exp)} | {got_s} | {dt:.1f} | {'✅' if ok else '❌'} |")

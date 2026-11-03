@@ -145,7 +145,7 @@ async def test_nothing_recognized_keeps_old_draft(env: Env) -> None:
 
 async def test_recognition_error_is_shown(env: Env) -> None:
     class Boom(FakeMatcher):
-        async def match(self, text, catalog, synonyms=None):
+        async def understand(self, text, catalog, synonyms=None):
             raise LlmError("Сервис распознавания сейчас недоступен. Попробуйте позже.")
 
     env.service.matcher = Boom()
@@ -727,3 +727,52 @@ async def test_silence_is_not_a_report(voice: Env) -> None:
     await voice.chat.send_voice()  # Whisper вернул пустой текст
     assert voice.chat.texts() == ["Не расслышал. Повторите голосовое или пришлите текстом."]
     assert voice.matcher.seen == []
+
+
+# ─────────────── «Сколько осталось по …» ───────────────
+
+
+async def ask_left(env: Env, *items: MatchedItem, text: str = "сколько осталось?") -> None:
+    env.matcher.intent = "question"
+    env.matcher.items = list(items)
+    await env.chat.say(text)
+    env.matcher.intent = "report"
+
+
+async def test_question_is_answered_with_plan_done_left(env: Env) -> None:
+    env.sheets.done = {55: 112.0}
+    await ask_left(env, clarify_qty(55), text="сколько осталось по кабелю 3х2,5?")
+    answer = env.chat.find("Кабель силовой")
+    assert answer.text.endswith("По смете 182 м, выполнено 112 м, осталось 70 м.")
+    assert answer.labels == ["📊 Открыть таблицу"]
+    assert await env.storage.get_draft(1) is None  # вопрос — не отчёт
+
+
+async def test_question_does_not_disturb_open_report(env: Env) -> None:
+    card = await report(env, clarify_qty(17))  # бот ждёт «сколько?» по меди
+    await ask_left(env, clarify_qty(55), text="а сколько осталось по кабелю 3х2,5?")
+    assert env.chat.find("Кабель силовой")
+    assert card.labels[0] == "✏️ Исправить"  # карточка жива, кнопки на месте
+    await env.chat.say("15")  # режим «жду число» не сбит
+    assert "1. ✅ Фреонопровод медный, Д6,35 TEC TUBE cips — 15 м" in card.text
+
+
+async def test_ambiguous_question_asks_which_position(env: Env) -> None:
+    env.sheets.done = {44: 300.0}
+    await ask_left(env, amb("хомутам", 0, [43, 44]), text="остаток по хомутам")
+    q = env.chat.find("«хомутам» — по какой позиции?")
+    assert "2. Хомут для крепления фреонопровода М8 32 мм" in q.text
+    assert q.labels == ["1", "2"]
+    await env.chat.press(q.id, "2")
+    assert q.text.endswith("По смете 527 шт, выполнено 300 шт, осталось 227 шт.")
+
+
+async def test_question_without_position(env: Env) -> None:
+    await ask_left(env, missing("сколько осталось?"))
+    assert env.chat.find("Не нашёл позицию. Спросите точнее")
+
+
+async def test_truncated_report_warns_master(env: Env) -> None:
+    env.matcher.truncated = True
+    await report(env, ok(17, 15))
+    assert env.chat.find("⚠️ Сообщение длинное — проверьте, все ли работы попали")

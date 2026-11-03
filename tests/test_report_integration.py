@@ -104,7 +104,7 @@ async def test_recognize_computes_remaining_from_real_sheet(
     matcher = FakeMatcher([ok(17, 15)])
     service.matcher = matcher
 
-    [item] = await service.recognize(USER, "медь")
+    [item] = (await service.recognize(USER, "медь")).items
 
     assert item.remaining == 265 - 140  # выполнено 140 по формуле I17
 

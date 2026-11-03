@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from m100bot.matching.llm import LlmError
-from m100bot.matching.models import MatchedItem, MatchStatus
+from m100bot.matching.models import Intent, MatchedItem, MatchStatus, Understood
 from m100bot.services.report import ReportError, ReportService, backoff_seconds
 from m100bot.sheets.addressing import CellChange, Mode
 from m100bot.sheets.catalog import Catalog
@@ -101,13 +101,15 @@ class FakeBitrix:
 class FakeMatcher:
     def __init__(self, items: list[MatchedItem] | None = None) -> None:
         self.items = items or []
+        self.intent: Intent = "report"
+        self.truncated = False
         self.seen: list[tuple[str, Catalog, Mapping[str, int] | None]] = []
 
-    async def match(
+    async def understand(
         self, text: str, catalog: Catalog, synonyms: Mapping[str, int] | None = None
-    ) -> list[MatchedItem]:
+    ) -> Understood:
         self.seen.append((text, catalog, synonyms))
-        return list(self.items)
+        return Understood(self.intent, list(self.items), self.truncated)
 
 
 class Clock:
@@ -181,7 +183,7 @@ async def test_recognize_saves_draft_and_marks_remaining(
     matcher = FakeMatcher([ok(17, 15), ok(18, 7)])
     service = ReportService(sheets, storage, matcher, today=lambda: D)
 
-    items = await service.recognize(USER, "медь 6-ка 15 м, 9-ка 7 м")
+    items = (await service.recognize(USER, "медь 6-ка 15 м, 9-ка 7 м")).items
 
     # остаток = план − выполнено: 265 − 140 = 125 (хватает), 162 − 160 = 2 (превышение)
     assert [(i.row, i.remaining, i.over_remaining) for i in items] == [
@@ -215,7 +217,7 @@ async def test_recognize_has_time_budget(
     sheets: FakeSheets, storage: Storage, catalog: Catalog
 ) -> None:
     class Slow(FakeMatcher):
-        async def match(self, text, catalog, synonyms=None):  # type: ignore[no-untyped-def]
+        async def understand(self, text, catalog, synonyms=None):  # type: ignore[no-untyped-def]
             await asyncio.sleep(10)
             return []
 
@@ -230,7 +232,7 @@ async def test_empty_result_keeps_previous_draft(
 ) -> None:
     await draft(storage, ok(17, 15))
     service = ReportService(sheets, storage, FakeMatcher([]), today=lambda: D)
-    assert await service.recognize(USER, "привет") == []
+    assert (await service.recognize(USER, "привет")).items == []
     saved = await storage.get_draft(USER)
     assert saved is not None and saved.items == [ok(17, 15)]
 
@@ -243,7 +245,7 @@ async def test_recognize_survives_unreadable_remaining_and_synonyms(
     matcher = FakeMatcher([ok(17, 15)])
     service = ReportService(sheets, storage, matcher, today=lambda: D)
     # без остатков просто нет предупреждения ⚠️, без синонимов — работаем без них
-    assert await service.recognize(USER, "медь") == [ok(17, 15)]
+    assert (await service.recognize(USER, "медь")).items == [ok(17, 15)]
     assert matcher.seen[0][2] == {}
 
 

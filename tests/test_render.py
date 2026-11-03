@@ -6,7 +6,7 @@ import pytest
 
 from m100bot.bot import render
 from m100bot.matching.models import MatchedItem, MatchStatus
-from m100bot.services.report import TodayLine
+from m100bot.services.report import RemainingLine, TodayLine
 from m100bot.sheets.catalog import Catalog
 
 D = date(2026, 11, 2)
@@ -188,3 +188,14 @@ def test_item_edit_text(catalog: Catalog) -> None:
 )
 def test_parse_qty_digits_and_words(text: str, qty: float | None) -> None:
     assert render.parse_qty(text) == qty
+
+
+def test_remaining_text() -> None:
+    lines = [
+        RemainingLine(55, "Кабель 3х2,5", "м", 182, 112),
+        RemainingLine(48, "Сверление Д80", "шт", 18, 20),
+    ]
+    assert render.remaining_text(lines) == (
+        "Кабель 3х2,5:\nПо смете 182 м, выполнено 112 м, осталось 70 м.\n\n"
+        "Сверление Д80:\nПо смете 18 шт, выполнено 20 шт — сверх сметы 2 шт."
+    )
