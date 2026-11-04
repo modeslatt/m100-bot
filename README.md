@@ -68,7 +68,7 @@ py -3.12 -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Заполнить `.env` (секреты вписываете сами, в git `.env` не попадает). Рядом с `.env` положить
+Заполнить `.env`. Рядом с `.env` положить
 `credentials.json` — ключ сервисного аккаунта Google.
 
 ### Telegram
